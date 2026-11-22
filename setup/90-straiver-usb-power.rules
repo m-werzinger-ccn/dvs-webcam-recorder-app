@@ -1,0 +1,4 @@
+# STRAIVER-Aufnahme-Laptop: USB-Autosuspend für alle USB-Geräte abschalten.
+# Verhindert, dass Linux Webcam/DVS/Mikrofon/Hub "schlafen legt" und sie danach
+# nicht mehr sauber aufwachen (typisches Symptom: Gerät weg bis zum Neu-Einstecken).
+ACTION=="add", SUBSYSTEM=="usb", TEST=="power/control", ATTR{power/control}="on"
