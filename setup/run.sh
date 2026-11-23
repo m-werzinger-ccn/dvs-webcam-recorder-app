@@ -3,4 +3,5 @@
 APP_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 VENV="${STRAIVER_VENV:-$HOME/straiver-venv}"
 cd "$APP_DIR"
-exec "$VENV/bin/python" main.py "$@"
+# -u: Ausgaben sofort schreiben (sonst ist die Reihenfolge im Log durcheinander)
+exec "$VENV/bin/python" -u main.py "$@"

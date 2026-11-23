@@ -38,6 +38,13 @@ RETRY_INTERVAL_S = 3.0
 PREVIEW_FPS = 25
 
 
+def _clean_error(e):
+    """Mehrzeilige HAL/LibUSB-Meldungen auf eine lesbare Zeile kürzen."""
+    lines = [l.strip() for l in str(e).splitlines() if l.strip(" -")]
+    text = " ".join(l for l in lines if l != "LibUSB") or e.__class__.__name__
+    return text.replace("LibUSB connection error: ", "")
+
+
 class DVSRecorder(QThread):
     """Thread für Vorschau und RAW-Aufnahme der DVS-Kamera."""
 
@@ -103,7 +110,7 @@ class DVSRecorder(QThread):
                 attempt = 0
                 self._stream(device, iterator)
             except Exception as e:
-                msg = str(e).strip() or e.__class__.__name__
+                msg = _clean_error(e)
                 print(f"[DVS] {msg}")
                 self._set_state("error", f"{msg} – neuer Versuch in {RETRY_INTERVAL_S:.0f} s")
             finally:

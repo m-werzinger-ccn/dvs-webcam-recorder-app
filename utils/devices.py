@@ -115,13 +115,22 @@ def _is_prophesee_usb(usb_dir):
     )
 
 
-def _list_cameras_linux():
+def _video_index(node):
+    try:
+        return int(os.path.basename(node)[len("video"):])
+    except ValueError:
+        return 10**6
+
+
+def _list_cameras_linux(sysfs_root="/sys/class/video4linux", dev_root="/dev"):
     cameras = []
+    seen_usb = set()
     by_id = _by_id_links()
 
-    for node in sorted(glob.glob("/sys/class/video4linux/video*")):
+    # numerisch sortieren (video2 vor video10)
+    for node in sorted(glob.glob(os.path.join(sysfs_root, "video*")), key=_video_index):
         dev_name = os.path.basename(node)  # video0
-        dev_path = f"/dev/{dev_name}"
+        dev_path = os.path.join(dev_root, dev_name)
         if not os.path.exists(dev_path):
             continue
 
@@ -133,8 +142,19 @@ def _list_cameras_linux():
         usb_dir = _usb_device_dir(os.path.join(node, "device"))
         if usb_dir and _is_prophesee_usb(usb_dir):
             continue  # DVS taucht nicht als Webcam auf
+        # Manche Webcams (z. B. Logitech C920) haben mehrere Bildknoten –
+        # pro USB-Gerät nur den ersten anzeigen.
+        if usb_dir:
+            if usb_dir in seen_usb:
+                continue
+            seen_usb.add(usb_dir)
 
-        name = _read(os.path.join(node, "name")) or dev_name
+        # Anzeigename: USB-Produktname (vollständig), sonst V4L2-Name
+        # (der ist auf 32 Zeichen gekürzt und oft doppelt: "Kamera: Kamer").
+        v4l_name = _read(os.path.join(node, "name")).split(":")[0].strip()
+        product = _read(os.path.join(usb_dir, "product")) if usb_dir else ""
+        name = " ".join((product or v4l_name or dev_name).split())
+
         stable = by_id.get(os.path.realpath(dev_path), "")
         key = os.path.basename(stable) if stable else (
             os.path.basename(usb_dir) + ":" + name if usb_dir else dev_name
