@@ -2,8 +2,14 @@
 # -*- coding: utf-8 -*-
 
 """
-VideoRecorder mit digitalem Zoom für DVS-Kompatibilität.
-Ermöglicht Software-Zoom der Webcam, um den Bildausschnitt der DVS-Kamera anzupassen.
+Webcam-Recorder mit digitalem Zoom, Audio und automatischer Wiederverbindung.
+
+Stabilität:
+- MJPG wird angefordert (unkomprimiertes 720p30 passt nicht durch USB 2.0
+  und blockiert sonst Bandbreite am Hub).
+- Geöffnet wird über den stabilen Pfad /dev/v4l/by-id/... (Linux).
+- Fällt die Kamera aus, wird automatisch neu verbunden; der Zustand wird über
+  status_changed(state, detail) gemeldet.
 """
 
 import os
@@ -17,8 +23,8 @@ import subprocess
 import tempfile
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QObject
 from PyQt5.QtGui import QImage
-from PyQt5.QtWidgets import QMessageBox
 import config
+from utils.devices import opencv_backend
 
 # PyAudio optional importieren
 try:
@@ -168,7 +174,7 @@ class ExternalAudioRecorder(QThread):
                     self.channels = int(device_info.get('maxInputChannels', 2))
 
                 if self.rate is None:
-                    self.rate = 41100  # Native Rate für die meisten USB-Mikrofone
+                    self.rate = 44100  # Startwert; die tatsächliche Rate wird unten ermittelt
 
                 print(f"Externes Mikrofon: {device_name}")
                 print(f"  Kanäle: {self.channels}, Sample-Rate: {self.rate} Hz")
@@ -523,18 +529,27 @@ class VideoProcessingWorker(QObject):
             print(f"Fehler beim Löschen der temporären Dateien: {e}")
 
 
+RECONNECT_INTERVAL_S = 3.0
+FRAME_TIMEOUT_S = 2.0  # ohne Bild so lange -> Kamera gilt als ausgefallen
+
+
 class VideoRecorder(QThread):
-    """Thread für die Videoaufnahme mit digitalem Zoom"""
+    """Thread für Vorschau und Aufnahme der Webcam."""
 
     update_frame = pyqtSignal(QImage)
     error_signal = pyqtSignal(str)
+    status_changed = pyqtSignal(str, str)  # state, detail
     processing_status = pyqtSignal(str)
     video_processing_completed = pyqtSignal()
-    zoom_changed = pyqtSignal(float)  # NEU: Signal für Zoom-Änderungen
+    zoom_changed = pyqtSignal(float)
+    recording_interrupted = pyqtSignal(str)
 
-    def __init__(self, camera_id=0, save_dir="", file_name="", audio_enabled=True):
+    def __init__(self, source=0, save_dir="", file_name="", audio_enabled=True,
+                 zoom_factor=1.5, camera_name=""):
         super().__init__()
-        self.camera_id = camera_id
+        self.source = source
+        self.camera_name = camera_name or str(source)
+        self._pending_source = None
         self.save_dir = save_dir
         self.file_name = file_name
         self.running = False
@@ -542,175 +557,233 @@ class VideoRecorder(QThread):
         self.video_writer = None
         self.cap = None
 
-        # Audio-Recorder
+        # Zustand
+        self.state = "connecting"
+        self.state_detail = ""
+        self.last_frame_time = 0.0
+        self._last_open_attempt = 0.0
+        self._interrupt_reported = False
+        self.frame_size = (1280, 720)
+        self.measured_fps = 0.0
+        self._fps_count = 0
+        self._fps_t0 = time.monotonic()
+
+        # Audio
         self.audio_recorder = None
         self.has_audio = audio_enabled
         self.temp_video_path = ""
         self.temp_audio_path = ""
         self.final_output_path = ""
 
-        # Timing-Variablen
+        # Timing
         self.start_time = None
         self.frame_count = 0
         self.target_fps = config.DEFAULT_FPS
         self.actual_fps = None
 
-        # NEU: Zoom-Parameter
-        self.zoom_factor = 1.5  # Standard-Zoom (1.0 = kein Zoom, 2.0 = 2x Zoom)
-        self.zoom_enabled = True  # Zoom standardmäßig aktiviert
+        # Zoom
+        self.zoom_factor = max(1.0, min(3.0, zoom_factor))
+        self.zoom_enabled = True
 
-        # Mutex
         self.mutex = threading.Lock()
 
-        # Worker Thread
         self.processing_thread = None
         self.processing_worker = None
 
-        # Dummy-Frame mit DVS-Auflösung
-        self.dummy_frame = np.zeros((720, 1280, 3), dtype=np.uint8)
-        cv2.putText(
-            self.dummy_frame,
-            "Keine Kamera verfügbar",
-            (400, 360),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1.5,
-            (255, 255, 255),
-            2,
-        )
+    # ----------------------------------------------------------------- Zoom
 
     def set_zoom(self, zoom_factor):
-        """Setzt den Zoom-Faktor (1.0 = kein Zoom, 2.0 = 2x Zoom)"""
         with self.mutex:
-            self.zoom_factor = max(1.0, min(3.0, zoom_factor))  # Begrenzt auf 1.0-3.0
-            print(f"Zoom-Faktor gesetzt auf: {self.zoom_factor:.2f}x")
-            self.zoom_changed.emit(self.zoom_factor)
+            self.zoom_factor = max(1.0, min(3.0, zoom_factor))
+        self.zoom_changed.emit(self.zoom_factor)
 
     def set_zoom_enabled(self, enabled):
-        """Aktiviert oder deaktiviert den Zoom"""
         with self.mutex:
             self.zoom_enabled = enabled
-            print(f"Zoom {'aktiviert' if enabled else 'deaktiviert'}")
 
     def apply_zoom(self, frame):
-        """Wendet digitalen Zoom auf ein Frame an"""
         if not self.zoom_enabled or self.zoom_factor <= 1.0:
             return frame
-
         h, w = frame.shape[:2]
-
-        # Berechne den neuen Bildausschnitt (zentriert)
-        new_w = int(w / self.zoom_factor)
-        new_h = int(h / self.zoom_factor)
-
-        # Zentrierter Ausschnitt
-        x = (w - new_w) // 2
-        y = (h - new_h) // 2
-
-        # Bild ausschneiden
+        new_w, new_h = int(w / self.zoom_factor), int(h / self.zoom_factor)
+        x, y = (w - new_w) // 2, (h - new_h) // 2
         cropped = frame[y : y + new_h, x : x + new_w]
+        return cv2.resize(cropped, (w, h), interpolation=cv2.INTER_LINEAR)
 
-        # Auf Original-Größe hochskalieren
-        zoomed = cv2.resize(cropped, (w, h), interpolation=cv2.INTER_LINEAR)
+    # --------------------------------------------------------------- Status
 
-        return zoomed
+    def _set_state(self, state, detail=""):
+        if (state, detail) != (self.state, self.state_detail):
+            self.state, self.state_detail = state, detail
+            self.status_changed.emit(state, detail)
+
+    def is_ready(self):
+        return (
+            self.cap is not None
+            and time.monotonic() - self.last_frame_time < FRAME_TIMEOUT_S
+        )
+
+    # ------------------------------------------------------------- Kamera
+
+    def set_source(self, source, camera_name=""):
+        """Wechselt die Kamera (nicht während einer Aufnahme)."""
+        if self.recording:
+            return False
+        self.camera_name = camera_name or str(source)
+        self._pending_source = source
+        return True
+
+    def open_camera(self):
+        self._release_cap()
+        self._last_open_attempt = time.monotonic()
+        self._set_state("connecting", f"Verbinde mit {self.camera_name}…")
+
+        cap = cv2.VideoCapture(self.source, opencv_backend())
+        if not cap.isOpened():
+            cap.release()
+            self._set_state(
+                "error",
+                f"Webcam nicht gefunden – neuer Versuch in {RECONNECT_INTERVAL_S:.0f} s",
+            )
+            return False
+
+        # MJPG zuerst setzen, dann Auflösung – sonst wählt der Treiber
+        # unkomprimiertes YUYV mit zu hoher USB-Bandbreite.
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        cap.set(cv2.CAP_PROP_FPS, self.target_fps)
+        if hasattr(cv2, "CAP_PROP_READ_TIMEOUT_MSEC"):
+            # Ohne Timeout blockiert read() bei abgezogener Kamera bis zu 10 s
+            cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, int(FRAME_TIMEOUT_S * 1000))
+
+        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fourcc = int(cap.get(cv2.CAP_PROP_FOURCC))
+        fourcc_str = "".join(chr((fourcc >> 8 * i) & 0xFF) for i in range(4)).strip()
+        print(f"[Webcam] {self.camera_name}: {w}x{h} @ {cap.get(cv2.CAP_PROP_FPS):.0f} fps, Format {fourcc_str or '?'}")
+
+        self.cap = cap
+        self._interrupt_reported = False
+        self._set_state("connecting", "Warte auf erstes Bild…")
+        return True
+
+    # Kompatibilität mit älterem Code
+    reopen_camera = open_camera
+
+    def _release_cap(self):
+        if self.cap is not None:
+            try:
+                self.cap.release()
+            except Exception:
+                pass
+            self.cap = None
+
+    # ------------------------------------------------------- Hauptschleife
 
     def run(self):
-        """Hauptschleife mit präzisem Timing und Zoom"""
+        self.running = True
         try:
-            self.running = True
             self.open_camera()
-
-            frame_interval = 1.0 / self.target_fps
-            next_frame_time = time.perf_counter()
-
             while self.running:
-                try:
-                    current_time = time.perf_counter()
+                if self._pending_source is not None:
+                    self.source, self._pending_source = self._pending_source, None
+                    self.open_camera()
 
-                    if current_time >= next_frame_time:
-                        # Frame abrufen
-                        if self.cap is not None and self.cap.isOpened():
-                            ret, frame = self.cap.read()
-                        else:
-                            ret = False
+                ok, frame = (False, None)
+                if self.cap is not None:
+                    try:
+                        ok, frame = self.cap.read()
+                    except cv2.error as e:
+                        print(f"[Webcam] read-Fehler: {e}")
+                        ok = False
 
-                        if not ret:
-                            frame = self.dummy_frame.copy()
-                            if (
-                                not hasattr(self, "last_reconnect")
-                                or time.time() - self.last_reconnect > 5.0
-                            ):
-                                self.last_reconnect = time.time()
-                                self.reopen_camera()
-                        else:
-                            # NEU: Zoom anwenden
-                            frame = self.apply_zoom(frame)
+                if not ok or frame is None:
+                    self._handle_missing_frame()
+                    continue
 
-                        # Frame aufnehmen wenn Recording aktiv
-                        with self.mutex:
-                            if self.recording and self.video_writer is not None and ret:
-                                self.video_writer.write(frame)
-                                self.frame_count += 1
+                self.last_frame_time = time.monotonic()
+                frame = self.apply_zoom(frame)
+                self.frame_size = (frame.shape[1], frame.shape[0])
 
-                        # Frame für GUI
-                        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                        h, w, ch = rgb_frame.shape
-                        bytes_per_line = ch * w
-                        qt_image = QImage(
-                            rgb_frame.data, w, h, bytes_per_line, QImage.Format_RGB888
-                        )
-                        self.update_frame.emit(qt_image)
+                with self.mutex:
+                    if self.recording and self.video_writer is not None:
+                        self.video_writer.write(frame)
+                        self.frame_count += 1
 
-                        next_frame_time += frame_interval
-
-                        if current_time > next_frame_time + frame_interval:
-                            next_frame_time = current_time + frame_interval
-
-                    else:
-                        time.sleep(0.001)
-
-                except Exception as e:
-                    print(f"Fehler in der Videoschleife: {e}")
-                    rgb_frame = cv2.cvtColor(self.dummy_frame, cv2.COLOR_BGR2RGB)
-                    h, w, ch = rgb_frame.shape
-                    bytes_per_line = ch * w
-                    qt_image = QImage(
-                        rgb_frame.data, w, h, bytes_per_line, QImage.Format_RGB888
-                    )
-                    self.update_frame.emit(qt_image)
-                    time.sleep(0.033)
-
+                self._update_fps()
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                h, w, ch = rgb.shape
+                # .copy(): das QImage darf nicht auf den numpy-Puffer zeigen,
+                # der nach dem Senden an den GUI-Thread freigegeben wird.
+                self.update_frame.emit(
+                    QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888).copy()
+                )
         except Exception as e:
-            self.error_signal.emit(f"Kritischer Fehler: {e}")
-            print(f"Kritischer Fehler: {e}")
+            self.error_signal.emit(f"Kritischer Webcam-Fehler: {e}")
+            print(f"[Webcam] Kritischer Fehler: {e}")
         finally:
             self.cleanup_resources()
 
-    def start_recording(self, save_dir=None, file_name=None):
-        """Startet die Videoaufnahme"""
-        if not self.running:
-            return False
+    def _handle_missing_frame(self):
+        since_last = time.monotonic() - self.last_frame_time
+        if self.cap is not None and since_last < FRAME_TIMEOUT_S:
+            time.sleep(0.01)  # kurzer Aussetzer, Kamera noch nicht aufgeben
+            return
 
+        if self.recording and not self._interrupt_reported:
+            self._interrupt_reported = True
+            msg = "Webcam liefert während der Aufnahme keine Bilder mehr!"
+            self.recording_interrupted.emit(msg)
+            self.error_signal.emit(msg)
+
+        self._emit_placeholder()
+        if time.monotonic() - self._last_open_attempt >= RECONNECT_INTERVAL_S:
+            if self.cap is not None:
+                self._set_state("error", "Keine Bilder von der Webcam – verbinde neu…")
+            self.open_camera()
+        else:
+            time.sleep(0.2)
+
+    def _update_fps(self):
+        self._fps_count += 1
+        now = time.monotonic()
+        if now - self._fps_t0 >= 1.0:
+            self.measured_fps = self._fps_count / (now - self._fps_t0)
+            self._fps_count, self._fps_t0 = 0, now
+            w, h = self.frame_size
+            detail = f"{w}×{h} · {self.measured_fps:.0f} fps"
+            if self.recording:
+                detail += " · REC"
+            self._set_state("ok", detail)
+
+    def _emit_placeholder(self):
+        frame = np.full((360, 640, 3), 40, dtype=np.uint8)
+        for i, line in enumerate(("Webcam nicht verbunden", "Verbinde automatisch neu...")):
+            cv2.putText(frame, line, (40, 170 + 40 * i), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.8, (230, 230, 230), 2)
+        self.update_frame.emit(QImage(frame.data, 640, 360, 640 * 3, QImage.Format_RGB888).copy())
+
+    # ------------------------------------------------------------ Aufnahme
+
+    def start_recording(self, save_dir=None, file_name=None):
+        """Startet die Aufnahme. Gibt (erfolg, meldung) zurück."""
+        if not self.running:
+            return False, "Webcam-Thread läuft nicht"
         with self.mutex:
             if self.recording:
-                return False
-
+                return False, "Aufnahme läuft bereits"
         if save_dir:
             self.save_dir = save_dir
         if file_name:
             self.file_name = file_name
-
         if not self.save_dir or not self.file_name:
-            self.error_signal.emit("Kein Speicherort oder Dateiname angegeben!")
-            return False
-
-        if self.cap is None or not self.cap.isOpened():
-            self.error_signal.emit("Keine Kamera verfügbar!")
-            return False
+            return False, "Kein Speicherort oder Dateiname angegeben"
+        if not self.is_ready():
+            return False, "Webcam liefert keine Bilder"
 
         try:
             os.makedirs(self.save_dir, exist_ok=True)
-
             temp_dir = tempfile.gettempdir()
             timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
             self.temp_video_path = os.path.join(temp_dir, f"temp_video_{timestamp}.avi")
@@ -719,73 +792,51 @@ class VideoRecorder(QThread):
                 self.save_dir, f"{self.file_name}{config.DEFAULT_VIDEO_EXTENSION}"
             )
 
-            # Frame-Größe (nach Zoom!)
-            width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-
-            if width <= 0 or height <= 0:
-                print(
-                    "Warnung: Ungültige Frame-Größe, verwende DVS-Standard (1280x720)"
+            with self.mutex:
+                self.video_writer = cv2.VideoWriter(
+                    self.temp_video_path,
+                    cv2.VideoWriter_fourcc(*"MJPG"),
+                    self.target_fps,
+                    self.frame_size,
                 )
-                width, height = 1280, 720
+                if not self.video_writer.isOpened():
+                    self.video_writer = None
+                    return False, "Video-Datei konnte nicht angelegt werden"
 
-            frame_size = (width, height)
+                self.start_time = time.perf_counter()
+                self.frame_count = 0
+                self._interrupt_reported = False
 
-            fourcc = cv2.VideoWriter_fourcc(*"MJPG")
+                if self.has_audio:
+                    self.audio_recorder = AudioRecorder(self.temp_audio_path)
+                    self.audio_recorder.set_start_time(self.start_time)
+                    self.audio_recorder.start()
 
-            try:
-                with self.mutex:
-                    self.video_writer = cv2.VideoWriter(
-                        self.temp_video_path, fourcc, self.target_fps, frame_size
-                    )
-
-                    if not self.video_writer.isOpened():
-                        raise Exception("Video Writer konnte nicht geöffnet werden")
-
-                    self.start_time = time.perf_counter()
-                    self.frame_count = 0
-
-                    if self.has_audio:
-                        self.audio_recorder = AudioRecorder(self.temp_audio_path)
-                        self.audio_recorder.set_start_time(self.start_time)
-                        self.audio_recorder.start()
-                        print(f"Audio aktiviert")
-
-                    self.recording = True
-                    print(f"Aufnahme gestartet mit Zoom {self.zoom_factor:.2f}x")
-                    return True
-
-            except Exception as e:
-                print(f"Fehler beim Starten: {e}")
-                self.error_signal.emit(f"Fehler: {e}")
-                with self.mutex:
-                    if self.video_writer is not None:
-                        self.video_writer.release()
-                        self.video_writer = None
-                    if self.audio_recorder is not None:
-                        self.audio_recorder.stop()
-                        self.audio_recorder = None
-                return False
-
+                self.recording = True
+            print(f"[Webcam] Aufnahme gestartet ({self.frame_size[0]}x{self.frame_size[1]}, Zoom {self.zoom_factor:.2f}x)")
+            return True, ""
         except Exception as e:
-            self.error_signal.emit(f"Fehler: {e}")
-            return False
+            with self.mutex:
+                if self.video_writer is not None:
+                    self.video_writer.release()
+                    self.video_writer = None
+            if self.audio_recorder is not None:
+                self.audio_recorder.stop()
+                self.audio_recorder = None
+            return False, str(e)
 
     def stop_recording(self):
-        """Stoppt die Aufnahme"""
+        """Stoppt die Aufnahme und startet die Nachverarbeitung (ffmpeg)."""
         try:
             with self.mutex:
                 if not self.recording:
                     return False
-
                 self.recording = False
 
                 if self.start_time and self.frame_count > 0:
                     duration = time.perf_counter() - self.start_time
                     self.actual_fps = self.frame_count / duration
-                    print(
-                        f"Aufnahme: {self.frame_count} Frames in {duration:.2f}s = {self.actual_fps:.2f} FPS"
-                    )
+                    print(f"[Webcam] {self.frame_count} Frames in {duration:.2f}s = {self.actual_fps:.2f} FPS")
                 else:
                     self.actual_fps = self.target_fps
 
@@ -793,19 +844,18 @@ class VideoRecorder(QThread):
                     self.video_writer.release()
                     self.video_writer = None
 
-                if self.has_audio and self.audio_recorder is not None:
-                    self.audio_recorder.stop()
+            if self.audio_recorder is not None:
+                self.audio_recorder.stop()
+                self.audio_recorder = None
 
-                self.start_video_processing()
-                return True
-
+            self.start_video_processing()
+            return True
         except Exception as e:
             self.error_signal.emit(f"Fehler beim Stoppen: {e}")
             self.recording = False
             return False
 
     def start_video_processing(self):
-        """Startet die Verarbeitung"""
         try:
             self.processing_worker = VideoProcessingWorker(
                 self.temp_video_path,
@@ -814,30 +864,20 @@ class VideoRecorder(QThread):
                 self.has_audio,
                 self.actual_fps,
             )
-
             self.processing_thread = QThread()
             self.processing_worker.moveToThread(self.processing_thread)
-
-            self.processing_worker.processing_progress.connect(
-                self.processing_status.emit
-            )
-            self.processing_worker.processing_finished.connect(
-                self.on_processing_finished
-            )
+            self.processing_worker.processing_progress.connect(self.processing_status.emit)
+            self.processing_worker.processing_finished.connect(self.on_processing_finished)
             self.processing_worker.processing_completed.connect(
                 self.video_processing_completed.emit
             )
             self.processing_thread.started.connect(self.processing_worker.process_video)
-
             self.processing_thread.start()
-            print("Video-Verarbeitung gestartet")
-
         except Exception as e:
             print(f"Fehler beim Starten der Verarbeitung: {e}")
             self.error_signal.emit(f"Fehler: {e}")
 
     def on_processing_finished(self, success, message):
-        """Wird nach Verarbeitung aufgerufen"""
         try:
             if success:
                 print(f"Verarbeitung erfolgreich: {message}")
@@ -845,101 +885,41 @@ class VideoRecorder(QThread):
             else:
                 print(f"Verarbeitung fehlgeschlagen: {message}")
                 self.error_signal.emit(f"Verarbeitung fehlgeschlagen: {message}")
-
             if self.processing_thread:
                 self.processing_thread.quit()
                 self.processing_thread.wait()
                 self.processing_thread = None
-
             self.processing_worker = None
-
         except Exception as e:
             print(f"Fehler beim Abschließen: {e}")
 
-    def open_camera(self):
-        """Öffnet die Kamera mit DVS-kompatibler Auflösung"""
-        try:
-            if self.cap is not None:
-                self.cap.release()
-                self.cap = None
-
-            # V4L2 Backend explizit verwenden um GStreamer-Konflikte zu vermeiden
-            self.cap = cv2.VideoCapture(self.camera_id, cv2.CAP_V4L2)
-
-            if not self.cap.isOpened():
-                # Fallback: ohne spezifisches Backend versuchen
-                print(f"V4L2-Backend fehlgeschlagen, versuche Standard-Backend...")
-                self.cap = cv2.VideoCapture(self.camera_id)
-
-            if not self.cap.isOpened():
-                self.error_signal.emit(
-                    f"Kamera {self.camera_id} konnte nicht geöffnet werden!"
-                )
-                return False
-
-            # Auflösung auf DVS-Format setzen
-            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-            self.cap.set(cv2.CAP_PROP_FPS, self.target_fps)
-
-            actual_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            actual_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            actual_fps = self.cap.get(cv2.CAP_PROP_FPS)
-
-            print(f"Kamera {self.camera_id} geöffnet:")
-            print(f"  Auflösung: {actual_width}x{actual_height}")
-            print(f"  FPS: {actual_fps}")
-            print(f"  Zoom: {self.zoom_factor:.2f}x")
-
-            if actual_width != 1280 or actual_height != 720:
-                print(
-                    f"  HINWEIS: Kamera unterstützt 1280x720 nicht, verwende {actual_width}x{actual_height}"
-                )
-
-            return True
-
-        except Exception as e:
-            self.error_signal.emit(f"Fehler beim Öffnen der Kamera: {e}")
-            return False
-
-    def reopen_camera(self):
-        """Versucht Kamera neu zu öffnen"""
-        return self.open_camera()
-
     def set_audio_enabled(self, enabled):
-        """Audio aktivieren/deaktivieren"""
         self.has_audio = enabled
 
-    def stop(self):
-        """Stoppt den Thread"""
-        self.running = False
+    # ---------------------------------------------------------------- Ende
+
+    def stop(self, timeout_ms=5000):
         if self.recording:
             self.stop_recording()
-        self.wait()
-        self.cleanup_resources()
+        self.running = False
+        if not self.wait(timeout_ms):
+            print("[Webcam] Warnung: Thread hat sich nicht rechtzeitig beendet")
+        # Laufende ffmpeg-Nachverarbeitung abwarten, damit kein Video verloren geht
+        if self.processing_thread is not None:
+            self.processing_thread.quit()
+            self.processing_thread.wait()
+            self.processing_thread = None
 
     def cleanup_resources(self):
-        """Gibt Ressourcen frei"""
+        """Gibt Kamera und Writer frei (läuft im Worker-Thread)."""
         try:
-            if hasattr(self, "video_writer") and self.video_writer is not None:
-                self.video_writer.release()
-                self.video_writer = None
-
-            if hasattr(self, "audio_recorder") and self.audio_recorder is not None:
+            with self.mutex:
+                if self.video_writer is not None:
+                    self.video_writer.release()
+                    self.video_writer = None
+            if self.audio_recorder is not None:
                 self.audio_recorder.stop()
                 self.audio_recorder = None
-
-            if hasattr(self, "cap") and self.cap is not None:
-                self.cap.release()
-                self.cap = None
-
-            if (
-                hasattr(self, "processing_thread")
-                and self.processing_thread is not None
-            ):
-                self.processing_thread.quit()
-                self.processing_thread.wait()
-                self.processing_thread = None
-
+            self._release_cap()
         except Exception as e:
             print(f"Fehler beim Freigeben der Ressourcen: {e}")

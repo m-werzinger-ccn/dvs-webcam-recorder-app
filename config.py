@@ -60,12 +60,12 @@ EXAMINATION_CATEGORIES = [
         "pointLabels": [
             "normal",
             "partielle Blickparese oder isolierte periphere/nukleäre Paresen (Nn, III, IV, VI)",
-            "komplette Blichparese oder fixierte Blickdeviation",
+            "komplette Blickparese oder fixierte Blickdeviation",
         ],
     },
     {
         "title": "3. Gesichtsfeld",
-        "description": "fingerperimetisch, alle Quadranten",
+        "description": "fingerperimetrisch, alle Quadranten",
         "points": 4,
         "pointLabels": [
             "keine Einschränkung",
@@ -93,7 +93,7 @@ EXAMINATION_CATEGORIES = [
             "10 sec. normal gehalten oder Amputation",
             "langsames unvollständiges Absinken",
             "schnelles vollständiges Absinken oder Anheben gegen Schwerkraft",
-            "Bewegung auf dr Unterlage, kein Anheben",
+            "Bewegung auf der Unterlage, kein Anheben",
             "keine Bewegung oder Koma",
         ],
     },
@@ -105,7 +105,7 @@ EXAMINATION_CATEGORIES = [
             "10 sec. normal gehalten oder Amputation",
             "langsames unvollständiges Absinken",
             "schnelles vollständiges Absinken oder Anheben gegen Schwerkraft",
-            "Bewegung auf dr Unterlage, kein Anheben",
+            "Bewegung auf der Unterlage, kein Anheben",
             "keine Bewegung oder Koma",
         ],
     },
@@ -114,7 +114,7 @@ EXAMINATION_CATEGORIES = [
         "description": "",
         "points": 5,
         "pointLabels": [
-            "5 sec. normal gehalten (stets im Ligen prüfen)",
+            "5 sec. normal gehalten (stets im Liegen prüfen)",
             "langsames unvollständiges Absinken",
             "schnelles vollständiges Absinken oder Anheben gegen Schwerkraft",
             "Bewegung auf der Unterlage, kein Anheben",
@@ -124,9 +124,9 @@ EXAMINATION_CATEGORIES = [
     {
         "title": "6b. Beinvorhalten rechts",
         "description": "",
-        "points": 4,
+        "points": 5,
         "pointLabels": [
-            "5 sec. normal gehalten (stets im Ligen prüfen)",
+            "5 sec. normal gehalten (stets im Liegen prüfen)",
             "langsames unvollständiges Absinken",
             "schnelles vollständiges Absinken oder Anheben gegen Schwerkraft",
             "Bewegung auf der Unterlage, kein Anheben",
@@ -138,7 +138,7 @@ EXAMINATION_CATEGORIES = [
         "description": "Finger-Nase-Versuch, Knie-Hacke-Versuch, offene Augen",
         "points": 3,
         "pointLabels": [
-            "keine Ataxie, Patient versteht Übung nicht, bei Parase oder Koma",
+            "keine Ataxie, Patient versteht Übung nicht, bei Parese oder Koma",
             "eine Extremität ataktisch",
             "mindestens zwei Extremitäten ataktisch",
         ],
@@ -149,7 +149,7 @@ EXAMINATION_CATEGORIES = [
         "points": 3,
         "pointLabels": [
             "normal",
-            "Hemihpästhesie, Seitendifferenz auf Schmerzreiz",
+            "Hemihypästhesie, Seitendifferenz auf Schmerzreiz",
             "Hemianästhesie, Hypästhesie beidseits, keine Schmerzreaktion beidseits oder Koma",
         ],
     },
@@ -170,8 +170,8 @@ EXAMINATION_CATEGORIES = [
         "points": 3,
         "pointLabels": [
             "normal oder Intubation",
-            "Dysarthisch, aber noch verständlich",
-            "kaum veständlich, keine Sprachproduktion, stumm, Koma",
+            "Dysarthrisch, aber noch verständlich",
+            "kaum verständlich, keine Sprachproduktion, stumm, Koma",
         ],
     },
     {
@@ -180,7 +180,7 @@ EXAMINATION_CATEGORIES = [
         "points": 3,
         "pointLabels": [
             "nicht vorhanden, Aphasie oder Verständigungsschwierigkeiten",
-            "eine Sinnesmodalität betroffen, Anosognie oder andere Neglectphänomene",
+            "eine Sinnesmodalität betroffen, Anosognosie oder andere Neglectphänomene",
             "beide Modalitäten betroffen oder Koma",
         ],
     },

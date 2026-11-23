@@ -2,660 +2,483 @@
 # -*- coding: utf-8 -*-
 
 """
-Dual-Kamera-Ansicht mit digitalem Zoom für die Webcam.
-Laptop-freundliche Fenstergrößen mit Zoom-Steuerung für DVS-Kompatibilität.
+Aufnahmefenster für einen NIHSS-Punkt.
+
+Die Kameras gehören der CameraSession (bleiben über die ganze Untersuchung
+offen). Dieses Fenster zeigt nur Vorschau und Status an und startet/stoppt
+die Aufnahme. Mit use_dvs=False wird nur die Webcam verwendet.
 """
 
-import os
 import datetime
+import os
+
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal
+from PyQt5.QtGui import QFont
 from PyQt5.QtWidgets import (
-    QWidget,
-    QVBoxLayout,
+    QApplication,
+    QDialog,
+    QGridLayout,
+    QGroupBox,
     QHBoxLayout,
-    QPushButton,
     QLabel,
     QMessageBox,
-    QDialog,
-    QSizePolicy,
-    QSplitter,
-    QApplication,
-    QGroupBox,
-    QGridLayout,
     QProgressBar,
+    QPushButton,
+    QSizePolicy,
     QSlider,
-    QScrollArea,
+    QSplitter,
+    QVBoxLayout,
+    QWidget,
 )
-from PyQt5.QtCore import Qt, pyqtSignal, QTimer
-from PyQt5.QtGui import QPixmap, QImage, QFont
 
-from recorder import DualRecorder, ExternalAudioRecorder
 import config
-from ui.video_widget import VideoDisplayWidget
+from recorder import ExternalAudioRecorder
+from recorder.camera_session import DEVICE_LABELS
 from ui.rating_dialog import RatingDialog
+from ui.status_panel import DeviceStatusPanel
+from ui.video_widget import VideoDisplayWidget
 
 
 class DualCameraView(QDialog):
-    """Dialogfenster mit Webcam-Zoom-Steuerung für DVS-Kompatibilität"""
+    """Vorschau + Aufnahmesteuerung für Webcam (und optional DVS)."""
 
     recording_state_changed = pyqtSignal(int, bool)
     recording_completed = pyqtSignal(int)
 
-    def __init__(self, card_id, camera_id, save_dir, file_name, parent=None):
+    def __init__(self, card_id, session, save_dir, file_name, use_dvs=True, parent=None):
         super().__init__(parent)
         self.card_id = card_id
-        self.camera_id = camera_id
+        self.session = session
         self.save_dir = save_dir
         self.file_name = file_name
+        self.use_dvs = use_dvs
         self.recording = False
         self.processing = False
-        self.audio_enabled = True
+        self.awaiting_processing = False
+        self.audio_enabled = session.audio_enabled
+        self.is_closing = False
+        self._showing_dialog = False
+        self._record_started_at = None
+        self.webcam_recording = False
 
-        # Externes Mikrofon
         self.external_mic_enabled = False
         self.external_mic_id = None
         self.external_audio_recorder = None
 
-        # Untersuchungskategorie
         if self.card_id < len(config.EXAMINATION_CATEGORIES):
             self.category = config.EXAMINATION_CATEGORIES[self.card_id]
         else:
             self.category = {"title": f"Aufnahme {self.card_id + 1}", "description": ""}
 
-        # Recorder
-        self.recorder = None
-
-        # Timer für Verarbeitungsüberwachung
-        self.processing_check_timer = QTimer()
-        self.processing_check_timer.timeout.connect(self.check_processing_completed)
-        self.was_processing = False
-
-        # Dummy-Bild mit reduzierter Größe für Laptop
-        self.dummy_image = QImage(960, 540, QImage.Format_RGB888)  # 75% von 1280x720
-        self.dummy_image.fill(Qt.darkGray)
-
         self.init_ui()
+        self._connect_session()
 
-        # Attribute für sanfte Schließung
-        self.is_closing = False
+        self._clock = QTimer(self)
+        self._clock.timeout.connect(self._tick)
+        self._clock.start(500)
+
+    # ------------------------------------------------------------------- UI
 
     def init_ui(self):
-        """Initialisiert die laptop-freundliche Benutzeroberfläche mit Zoom-Steuerung"""
-        self.setWindowTitle(f"{self.category['title']} - Dual-Kamera mit Zoom")
+        mode = "Webcam + DVS" if self.use_dvs else "Nur Webcam"
+        self.setWindowTitle(f"{self.category['title']} – {mode}")
+        self.setMinimumSize(1600 if self.use_dvs else 1000, 720)
 
-        # REDUZIERTE Fenstergröße für Laptops (statt 2600x850)
-        self.setMinimumSize(1600, 720)  # Passt auf die meisten Laptop-Bildschirme
-
-        # Hauptlayout mit Scroll-Bereich
         main_layout = QVBoxLayout()
 
-        # Titel
         title_font = QFont()
         title_font.setBold(True)
         title_font.setPointSize(14)
-
         self.title_label = QLabel(self.category["title"])
         self.title_label.setFont(title_font)
         self.title_label.setAlignment(Qt.AlignCenter)
         main_layout.addWidget(self.title_label)
 
-        # Beschreibung
-        if self.category["description"]:
-            self.description_label = QLabel(self.category["description"])
-            self.description_label.setAlignment(Qt.AlignCenter)
-            self.description_label.setWordWrap(True)
-            main_layout.addWidget(self.description_label)
+        if self.category.get("description"):
+            desc = QLabel(self.category["description"])
+            desc.setAlignment(Qt.AlignCenter)
+            desc.setWordWrap(True)
+            main_layout.addWidget(desc)
 
-        # Scroll-Bereich für die Kamera-Ansichten
-        scroll_area = QScrollArea()
-        scroll_area.setWidgetResizable(True)
-        scroll_content = QWidget()
-        scroll_layout = QHBoxLayout(scroll_content)
+        # Gerätestatus (Ampel)
+        self.status_panel = DeviceStatusPanel(self.session, compact=True)
+        main_layout.addWidget(self.status_panel)
 
-        # Splitter für die beiden Kamerabilder (REDUZIERTE Größe)
+        # Warnbanner bei Verbindungsabbruch während der Aufnahme
+        self.alert_label = QLabel("")
+        self.alert_label.setWordWrap(True)
+        self.alert_label.setStyleSheet(
+            "background:#dc3545; color:white; font-weight:bold; padding:8px; border-radius:4px;"
+        )
+        self.alert_label.setVisible(False)
+        main_layout.addWidget(self.alert_label)
+
         self.splitter = QSplitter(Qt.Horizontal)
 
-        # Webcam-Container mit Zoom-Steuerung
+        # Webcam
         webcam_container = QWidget()
         webcam_layout = QVBoxLayout(webcam_container)
-
-        webcam_title = QLabel("Webcam (mit Digital-Zoom)")
-        webcam_title.setAlignment(Qt.AlignCenter)
-        webcam_title_font = QFont()
-        webcam_title_font.setBold(True)
-        webcam_title_font.setPointSize(11)
-        webcam_title.setFont(webcam_title_font)
-        webcam_layout.addWidget(webcam_title)
-
-        # Webcam-Vorschau (REDUZIERTE Größe: 75% von 1280x720)
+        webcam_layout.addWidget(self._section_title("Webcam (mit Digital-Zoom)"))
         self.webcam_label = VideoDisplayWidget()
         self.webcam_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.webcam_label.setMinimumSize(640, 360)  # Mindestgröße
-        self.webcam_label.setText("Webcam wird initialisiert...")
+        self.webcam_label.setMinimumSize(640, 360)
+        self.webcam_label.setText("Webcam wird verbunden…")
         webcam_layout.addWidget(self.webcam_label)
-
-        # Zoom-Steuerung für Webcam
-        zoom_group = QGroupBox("Digital-Zoom (für DVS-Anpassung)")
-        zoom_layout = QVBoxLayout()
-
-        # Zoom-Info
-        zoom_info_layout = QHBoxLayout()
-        zoom_info_layout.addWidget(QLabel("Zoom:"))
-        self.zoom_value_label = QLabel("1.5x")  # Standard-Zoom
-        self.zoom_value_label.setStyleSheet("font-weight: bold; color: #0066cc;")
-        zoom_info_layout.addWidget(self.zoom_value_label)
-        zoom_info_layout.addStretch()
-        zoom_layout.addLayout(zoom_info_layout)
-
-        # Zoom-Slider (1.0x bis 3.0x)
-        self.zoom_slider = QSlider(Qt.Horizontal)
-        self.zoom_slider.setMinimum(10)  # 1.0x
-        self.zoom_slider.setMaximum(30)  # 3.0x
-        self.zoom_slider.setValue(15)  # 1.5x Standard
-        self.zoom_slider.setTickPosition(QSlider.TicksBelow)
-        self.zoom_slider.setTickInterval(5)
-        self.zoom_slider.valueChanged.connect(self.on_zoom_changed)
-        zoom_layout.addWidget(self.zoom_slider)
-
-        # Zoom-Beschriftungen
-        zoom_labels_layout = QHBoxLayout()
-        zoom_labels_layout.addWidget(QLabel("1.0x"))
-        zoom_labels_layout.addStretch()
-        zoom_labels_layout.addWidget(QLabel("1.5x"))
-        zoom_labels_layout.addStretch()
-        zoom_labels_layout.addWidget(QLabel("2.0x"))
-        zoom_labels_layout.addStretch()
-        zoom_labels_layout.addWidget(QLabel("2.5x"))
-        zoom_labels_layout.addStretch()
-        zoom_labels_layout.addWidget(QLabel("3.0x"))
-        zoom_layout.addLayout(zoom_labels_layout)
-
-        # Hinweis
-        zoom_hint = QLabel(
-            "💡 Passen Sie den Zoom an, um den Bildausschnitt der DVS-Kamera zu erreichen"
-        )
-        zoom_hint.setWordWrap(True)
-        zoom_hint.setStyleSheet("color: #666; font-size: 10px; font-style: italic;")
-        zoom_layout.addWidget(zoom_hint)
-
-        zoom_group.setLayout(zoom_layout)
-        webcam_layout.addWidget(zoom_group)
-
-        # DVS-Container
-        dvs_container = QWidget()
-        dvs_layout = QVBoxLayout(dvs_container)
-
-        dvs_title = QLabel("DVS-Kamera (Prophesee IMX636)")
-        dvs_title.setAlignment(Qt.AlignCenter)
-        dvs_title_font = QFont()
-        dvs_title_font.setBold(True)
-        dvs_title_font.setPointSize(11)
-        dvs_title.setFont(dvs_title_font)
-        dvs_layout.addWidget(dvs_title)
-
-        # DVS-Vorschau (REDUZIERTE Größe)
-        self.dvs_label = VideoDisplayWidget()
-        self.dvs_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.dvs_label.setMinimumSize(640, 360)
-        self.dvs_label.setText("DVS-Kamera wird initialisiert...")
-        dvs_layout.addWidget(self.dvs_label)
-
-        # Info für DVS
-        dvs_info = QLabel("Native Auflösung: 1280x720 | 12mm IR-Linse")
-        dvs_info.setAlignment(Qt.AlignCenter)
-        dvs_info.setStyleSheet("color: #666; font-size: 10px;")
-        dvs_layout.addWidget(dvs_info)
-
-        # Container zum Splitter hinzufügen
+        webcam_layout.addWidget(self._build_zoom_group())
         self.splitter.addWidget(webcam_container)
-        self.splitter.addWidget(dvs_container)
 
-        scroll_layout.addWidget(self.splitter)
-        scroll_area.setWidget(scroll_content)
-        main_layout.addWidget(scroll_area)
+        # DVS
+        self.dvs_label = None
+        if self.use_dvs:
+            dvs_container = QWidget()
+            dvs_layout = QVBoxLayout(dvs_container)
+            dvs_layout.addWidget(self._section_title("DVS-Kamera (Prophesee)"))
+            self.dvs_label = VideoDisplayWidget()
+            self.dvs_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+            self.dvs_label.setMinimumSize(640, 360)
+            self.dvs_label.setText("DVS-Kamera wird verbunden…")
+            dvs_layout.addWidget(self.dvs_label)
+            self.splitter.addWidget(dvs_container)
 
-        # Fortschrittsbalken
+        main_layout.addWidget(self.splitter, 1)
+
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
         self.progress_bar.setRange(0, 0)
         main_layout.addWidget(self.progress_bar)
 
-        # Aufnahmeinformationen
-        info_group = QGroupBox("Aufnahmeinformationen")
+        info_group = QGroupBox("Aufnahme")
         info_layout = QGridLayout()
-
-        # Status
         self.status_label = QLabel("Bereit")
-        self.status_label.setAlignment(Qt.AlignCenter)
         info_layout.addWidget(QLabel("Status:"), 0, 0)
         info_layout.addWidget(self.status_label, 0, 1)
-
-        # Dateiname
         self.file_label = QLabel(self.file_name)
         info_layout.addWidget(QLabel("Dateiname:"), 0, 2)
         info_layout.addWidget(self.file_label, 0, 3)
-
-        # Audio
-        self.audio_label = QLabel("Aktiviert" if self.audio_enabled else "Deaktiviert")
-        info_layout.addWidget(QLabel("Webcam-Audio:"), 1, 0)
-        info_layout.addWidget(self.audio_label, 1, 1)
-
-        # Externes Mikrofon
-        self.external_mic_label = QLabel(
-            "Aktiviert" if self.external_mic_enabled else "Deaktiviert"
-        )
-        info_layout.addWidget(QLabel("Ext. Mikrofon:"), 2, 0)
-        info_layout.addWidget(self.external_mic_label, 2, 1)
-
-        # Zeitstempel
-        self.timestamp_label = QLabel(
-            datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        )
-        info_layout.addWidget(QLabel("Aufnahmezeit:"), 2, 2)
-        info_layout.addWidget(self.timestamp_label, 2, 3)
-
-        self.timer = self.startTimer(1000)
-
+        self.duration_label = QLabel("00:00")
+        self.duration_label.setStyleSheet("font-weight:bold;")
+        info_layout.addWidget(QLabel("Dauer:"), 1, 0)
+        info_layout.addWidget(self.duration_label, 1, 1)
+        self.audio_label = QLabel("")
+        info_layout.addWidget(QLabel("Audio:"), 1, 2)
+        info_layout.addWidget(self.audio_label, 1, 3)
+        info_layout.setColumnStretch(1, 1)
+        info_layout.setColumnStretch(3, 1)
         info_group.setLayout(info_layout)
         main_layout.addWidget(info_group)
+        self._update_audio_label()
 
-        # Buttons
         button_layout = QHBoxLayout()
-
         self.record_button = QPushButton("Aufnahme starten")
+        self.record_button.setMinimumHeight(44)
+        self.record_button.setStyleSheet("font-size:15px; font-weight:bold;")
         self.record_button.clicked.connect(self.toggle_recording)
-        button_layout.addWidget(self.record_button)
-
+        button_layout.addWidget(self.record_button, 3)
         self.close_button = QPushButton("Schließen")
+        self.close_button.setMinimumHeight(44)
         self.close_button.clicked.connect(self.safe_close)
-        button_layout.addWidget(self.close_button)
-
+        button_layout.addWidget(self.close_button, 1)
         main_layout.addLayout(button_layout)
 
         self.setLayout(main_layout)
 
-    def on_zoom_changed(self, value):
-        """Wird aufgerufen, wenn der Zoom-Slider bewegt wird"""
-        zoom_factor = value / 10.0  # Umrechnung: 10 = 1.0x, 15 = 1.5x, etc.
-        self.zoom_value_label.setText(f"{zoom_factor:.1f}x")
+    def _section_title(self, text):
+        label = QLabel(text)
+        label.setAlignment(Qt.AlignCenter)
+        font = QFont()
+        font.setBold(True)
+        font.setPointSize(11)
+        label.setFont(font)
+        return label
 
-        # Zoom im Recorder setzen
-        if self.recorder and hasattr(self.recorder, "webcam_recorder"):
-            if self.recorder.webcam_recorder:
-                self.recorder.webcam_recorder.set_zoom(zoom_factor)
+    def _build_zoom_group(self):
+        zoom_group = QGroupBox("Digital-Zoom (Bildausschnitt an DVS anpassen)")
+        zoom_layout = QHBoxLayout()
+        zoom_layout.addWidget(QLabel("1.0x"))
+        self.zoom_slider = QSlider(Qt.Horizontal)
+        self.zoom_slider.setRange(10, 30)
+        self.zoom_slider.setValue(int(round(self.session.zoom_factor * 10)))
+        self.zoom_slider.setTickPosition(QSlider.TicksBelow)
+        self.zoom_slider.setTickInterval(5)
+        self.zoom_slider.valueChanged.connect(self.on_zoom_changed)
+        zoom_layout.addWidget(self.zoom_slider, 1)
+        zoom_layout.addWidget(QLabel("3.0x"))
+        self.zoom_value_label = QLabel(f"{self.session.zoom_factor:.1f}x")
+        self.zoom_value_label.setStyleSheet("font-weight: bold; color: #0066cc;")
+        zoom_layout.addWidget(self.zoom_value_label)
+        zoom_group.setLayout(zoom_layout)
+        return zoom_group
 
-    def set_audio_enabled(self, enabled):
-        """Aktiviert oder deaktiviert die Audioaufnahme"""
-        self.audio_enabled = enabled
-        self.audio_label.setText("Aktiviert" if enabled else "Deaktiviert")
-
-        if self.recorder and hasattr(self.recorder, "webcam_recorder"):
-            if self.recorder.webcam_recorder:
-                self.recorder.webcam_recorder.has_audio = enabled
-
-    def set_external_mic(self, enabled, mic_id=None):
-        """Setzt die externen Mikrofon-Einstellungen"""
-        print(f"[DualCameraView] set_external_mic: enabled={enabled}, mic_id={mic_id}")
-        self.external_mic_enabled = enabled
-        self.external_mic_id = mic_id
-        self.external_mic_label.setText("Aktiviert" if enabled else "Deaktiviert")
-
-    def showEvent(self, event):
-        """Wird aufgerufen, wenn das Fenster angezeigt wird"""
-        super().showEvent(event)
-        self.start_recorder()
-
-    def closeEvent(self, event):
-        """Wird aufgerufen, wenn das Fenster geschlossen wird"""
-        if not self.is_closing:
-            self.safe_close()
-            event.ignore()
+    def _update_audio_label(self):
+        if self.external_mic_enabled and self.external_mic_id is not None:
+            text = "Externes Mikrofon"
+        elif self.audio_enabled:
+            text = "Standard-Mikrofon des Systems"
         else:
-            super().closeEvent(event)
+            text = "aus"
+        self.audio_label.setText(text)
 
-    def timerEvent(self, event):
-        """Aktualisiert die Zeitanzeige"""
-        if self.recording:
-            self.timestamp_label.setText(
-                datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            )
+    # -------------------------------------------------------------- Session
 
-    def safe_close(self):
-        """Sichere Schließung des Fensters"""
-        try:
-            self.killTimer(self.timer)
-            if hasattr(self, "processing_check_timer"):
-                self.processing_check_timer.stop()
+    def _connect_session(self):
+        s = self.session
+        s.webcam_frame.connect(self.update_webcam_frame)
+        if self.use_dvs:
+            s.dvs_frame.connect(self.update_dvs_frame)
+        s.processing_status.connect(self.on_processing_status)
+        s.recording_interrupted.connect(self.on_recording_interrupted)
 
-            if self.processing:
-                reply = QMessageBox.question(
-                    self,
-                    "Video wird verarbeitet",
-                    "Das Video wird gerade verarbeitet. Möchten Sie wirklich schließen?\n"
-                    "Die Verarbeitung läuft im Hintergrund weiter.",
-                    QMessageBox.Yes | QMessageBox.No,
-                    QMessageBox.No,
-                )
-                if reply == QMessageBox.No:
-                    return
-
-            if self.recording and self.recorder:
-                self.record_button.setEnabled(False)
-                self.close_button.setEnabled(False)
-                self.status_label.setText("Aufnahme wird gestoppt...")
-                QApplication.processEvents()
-
-                # Externes Mikrofon stoppen
-                if self.external_audio_recorder is not None:
-                    self.external_audio_recorder.stop()
-                    self.external_audio_recorder = None
-
-                self.recorder.stop_recording()
-                self.recording = False
-                self.recording_state_changed.emit(self.card_id, False)
-
-            self.stop_recorder()
-            self.is_closing = True
-            self.close()
-
-        except Exception as e:
-            print(f"Fehler beim sicheren Schließen: {e}")
-            self.is_closing = True
-            self.close()
-
-    def start_recorder(self):
-        """Startet den Dual-Recorder"""
-        try:
-            self.stop_recorder()
-
-            self.webcam_label.setText("Webcam wird initialisiert...")
-            self.dvs_label.setText("DVS-Kamera wird initialisiert...")
-
-            print("Initialisiere DualRecorder...")
-
-            self.recorder = DualRecorder(
-                webcam_id=self.camera_id,
-                save_dir=self.save_dir,
-                file_name=self.file_name,
-                audio_enabled=self.audio_enabled,
-            )
-            self.recorder.error_signal.connect(self.on_recorder_error)
-            self.recorder.status_signal.connect(self.on_recorder_status)
-
-            if (
-                hasattr(self.recorder, "webcam_recorder")
-                and self.recorder.webcam_recorder
-            ):
-                self.recorder.webcam_recorder.has_audio = self.audio_enabled
-
-            print("Verbinde Recorder-Signale...")
-
-            success = self.recorder.initialize()
-
-            if success:
-                if self.recorder.webcam_recorder:
-                    print("Verbinde Webcam-Signale")
-                    self.recorder.webcam_recorder.update_frame.connect(
-                        self.update_webcam_frame
-                    )
-                    self.recorder.webcam_recorder.processing_status.connect(
-                        self.on_processing_status
-                    )
-
-                    # NEU: Initial-Zoom setzen
-                    initial_zoom = self.zoom_slider.value() / 10.0
-                    self.recorder.webcam_recorder.set_zoom(initial_zoom)
-                    print(f"Initial-Zoom gesetzt auf {initial_zoom:.1f}x")
-                else:
-                    print("Kein Webcam-Recorder verfügbar")
-
-                if self.recorder.dvs_recorder:
-                    print("Verbinde DVS-Signale")
-                    self.recorder.dvs_recorder.update_frame.connect(
-                        self.update_dvs_frame
-                    )
-                else:
-                    print("Kein DVS-Recorder verfügbar")
-            else:
-                self.status_label.setText("Fehler bei der Initialisierung")
-                self.record_button.setEnabled(False)
-
-            print(f"Dual-Recorder gestartet: {success}")
-        except Exception as e:
-            print(f"Fehler beim Starten des Recorders: {e}")
-            self.status_label.setText(f"Fehler: {e}")
-            self.record_button.setEnabled(False)
-            import traceback
-
-            traceback.print_exc()
-
-    def stop_recorder(self):
-        """Stoppt den Dual-Recorder"""
-        try:
-            if self.recorder:
-                try:
-                    self.recorder.error_signal.disconnect(self.on_recorder_error)
-                    self.recorder.status_signal.disconnect(self.on_recorder_status)
-
-                    if self.recorder.webcam_recorder:
-                        try:
-                            self.recorder.webcam_recorder.update_frame.disconnect(
-                                self.update_webcam_frame
-                            )
-                            self.recorder.webcam_recorder.processing_status.disconnect(
-                                self.on_processing_status
-                            )
-                        except:
-                            pass
-
-                    if self.recorder.dvs_recorder:
-                        try:
-                            self.recorder.dvs_recorder.update_frame.disconnect(
-                                self.update_dvs_frame
-                            )
-                        except:
-                            pass
-                except:
-                    pass
-
-                self.recorder.stop()
-                self.recorder = None
-
-                self.webcam_label.setText("Webcam wird gestoppt...")
-                self.dvs_label.setText("DVS-Kamera wird gestoppt...")
-
-                print("Dual-Recorder gestoppt")
-        except Exception as e:
-            print(f"Fehler beim Stoppen des Recorders: {e}")
-            import traceback
-
-            traceback.print_exc()
+    def _disconnect_session(self):
+        s = self.session
+        pairs = [
+            (s.webcam_frame, self.update_webcam_frame),
+            (s.dvs_frame, self.update_dvs_frame),
+            (s.processing_status, self.on_processing_status),
+            (s.recording_interrupted, self.on_recording_interrupted),
+        ]
+        for signal, slot in pairs:
+            try:
+                signal.disconnect(slot)
+            except (TypeError, RuntimeError):
+                pass
 
     def update_webcam_frame(self, image):
-        """Aktualisiert die Webcam-Vorschau"""
-        if self.is_closing:
-            return
-
-        try:
+        if not self.is_closing:
             self.webcam_label.setImage(image)
-        except Exception as e:
-            print(f"Fehler beim Aktualisieren des Webcam-Frames: {e}")
 
     def update_dvs_frame(self, image):
-        """Aktualisiert die DVS-Vorschau"""
-        if self.is_closing:
-            return
-
-        try:
+        if not self.is_closing and self.dvs_label is not None:
             self.dvs_label.setImage(image)
-        except Exception as e:
-            print(f"Fehler beim Aktualisieren des DVS-Frames: {e}")
 
-    def on_recorder_error(self, error_msg):
-        """Wird bei Recorder-Fehlern aufgerufen"""
-        self.status_label.setText(f"Fehler: {error_msg}")
-        print(f"Recorder-Fehler: {error_msg}")
+    # --------------------------------------------------------- Einstellungen
 
-    def on_recorder_status(self, status_msg):
-        """Wird bei Statusänderungen aufgerufen"""
-        self.status_label.setText(status_msg)
-        print(f"Recorder-Status: {status_msg}")
+    def on_zoom_changed(self, value):
+        factor = value / 10.0
+        self.zoom_value_label.setText(f"{factor:.1f}x")
+        self.session.set_zoom(factor)
 
-    def on_processing_status(self, status_msg):
-        """Wird bei Änderungen des Verarbeitungsstatus aufgerufen"""
-        self.status_label.setText(status_msg)
-        print(f"Processing Status: {status_msg}")
+    def set_audio_enabled(self, enabled):
+        self.audio_enabled = enabled
+        self._update_audio_label()
 
-        if "Verarbeite" in status_msg or "Konvertiere" in status_msg:
-            self.processing = True
-            self.was_processing = True
-            self.progress_bar.setVisible(True)
-            self.record_button.setEnabled(False)
-            self.zoom_slider.setEnabled(False)  # Zoom während Verarbeitung sperren
-
-            if not self.processing_check_timer.isActive():
-                self.processing_check_timer.start(1000)
-                print("Starte Timer zur Überwachung der Verarbeitung...")
-
-        elif "erfolgreich" in status_msg or "gespeichert" in status_msg:
-            self.processing = False
-            self.progress_bar.setVisible(False)
-            self.record_button.setEnabled(True)
-            self.zoom_slider.setEnabled(True)  # Zoom wieder freigeben
-
-            print("Video erfolgreich gespeichert - zeige Bewertungsdialog")
-            QTimer.singleShot(100, self.show_rating_dialog)
-
-    def check_processing_completed(self):
-        """Prüft, ob die Verarbeitung abgeschlossen ist"""
-        try:
-            if not self.processing and self.was_processing:
-                print("Timer erkannt: Verarbeitung abgeschlossen")
-                self.processing_check_timer.stop()
-                self.was_processing = False
-        except Exception as e:
-            print(f"Fehler bei der Verarbeitungsüberprüfung: {e}")
+    def set_external_mic(self, enabled, mic_id=None):
+        self.external_mic_enabled = enabled
+        self.external_mic_id = mic_id
+        self._update_audio_label()
 
     def set_file_name(self, file_name):
-        """Setzt den Dateinamen"""
         self.file_name = file_name
         self.file_label.setText(file_name)
-        if self.recorder:
-            self.recorder.file_name = file_name
 
     def set_save_directory(self, directory):
-        """Setzt das Speicherverzeichnis"""
         self.save_dir = directory
-        if self.recorder:
-            self.recorder.save_dir = directory
+
+    # -------------------------------------------------------------- Aufnahme
+
+    def _not_ready_devices(self):
+        missing = []
+        if not self.session.is_ready("webcam"):
+            missing.append("webcam")
+        if self.use_dvs and self.session.status("dvs")[0] not in ("ok", "warn"):
+            missing.append("dvs")
+        return missing
 
     def toggle_recording(self):
-        """Startet oder stoppt die Aufnahme"""
-        if not self.recorder:
-            QMessageBox.warning(self, "Warnung", "Kameras nicht bereit!")
+        if self.recording:
+            self._stop_recording()
+        else:
+            self._start_recording()
+
+    def _start_recording(self):
+        storage = self.session.check_storage()
+        if storage.state == "error":
+            QMessageBox.critical(self, "Speicher", f"Aufnahme nicht möglich:\n{storage.message}")
             return
 
-        if not self.recording:
-            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            if self.file_name == f"recording_{self.card_id}" or not self.file_name:
-                category_name = os.path.basename(self.save_dir)
-                self.file_name = f"{category_name}_{timestamp}"
-                self.file_name = "".join(
-                    c for c in self.file_name if c.isalnum() or c in "_-"
-                )
-                self.file_label.setText(self.file_name)
-
-            os.makedirs(self.save_dir, exist_ok=True)
-
-            # Wenn externes Mikrofon aktiviert ist, internes Audio deaktivieren
-            # (ALSA unterstützt nicht mehrere Audio-Streams gleichzeitig)
-            if self.external_mic_enabled and self.external_mic_id is not None:
-                if self.recorder.webcam_recorder:
-                    self.recorder.webcam_recorder.has_audio = False
-                    print("[DualCameraView] Internes Audio deaktiviert (externes Mikrofon aktiv)")
-
-            success = self.recorder.start_recording(self.save_dir, self.file_name)
-            if success:
-                # Externes Mikrofon starten (synchron mit Video)
-                print(f"[DualCameraView] toggle_recording: external_mic_enabled={self.external_mic_enabled}, external_mic_id={self.external_mic_id}")
-                if self.external_mic_enabled and self.external_mic_id is not None:
-                    external_audio_path = os.path.join(
-                        self.save_dir, f"{self.file_name}_audio.wav"
-                    )
-                    self.external_audio_recorder = ExternalAudioRecorder(
-                        external_audio_path, self.external_mic_id
-                    )
-                    # Synchronisation mit Video-Startzeit
-                    if (
-                        self.recorder.webcam_recorder
-                        and self.recorder.webcam_recorder.start_time
-                    ):
-                        self.external_audio_recorder.set_start_time(
-                            self.recorder.webcam_recorder.start_time
-                        )
-                    self.external_audio_recorder.start()
-                    print(f"Externes Mikrofon gestartet: {external_audio_path}")
-
-                self.recording = True
-                self.record_button.setText("Aufnahme stoppen")
-                self.status_label.setText("Aufnahme läuft...")
-                self.zoom_slider.setEnabled(False)  # Zoom während Aufnahme sperren
-                self.recording_state_changed.emit(self.card_id, True)
-        else:
-            self.record_button.setEnabled(False)
-            self.status_label.setText("Aufnahme wird gestoppt...")
-            QApplication.processEvents()
-
-            # Externes Mikrofon stoppen
-            if self.external_audio_recorder is not None:
-                print("Stoppe externes Mikrofon...")
-                self.external_audio_recorder.stop()
-                self.external_audio_recorder = None
-
-            self.recorder.stop_recording()
-            self.recording = False
-            self.record_button.setText("Aufnahme starten")
-            self.recording_state_changed.emit(self.card_id, False)
-
-            self.was_processing = False
-
-    def show_rating_dialog(self):
-        """Zeigt den Bewertungsdialog an"""
-        try:
-            print("=== ZEIGE BEWERTUNGSDIALOG ===")
-
-            if hasattr(self, "_showing_dialog") and self._showing_dialog:
-                print("Dialog wird bereits angezeigt")
+        missing = self._not_ready_devices()
+        wanted = ["webcam"] + (["dvs"] if self.use_dvs else [])
+        if set(missing) == set(wanted):
+            QMessageBox.critical(
+                self,
+                "Keine Kamera bereit",
+                "Keine Kamera liefert gerade ein Bild.\n\n"
+                "Bitte oben bei der roten Kamera auf „Neu verbinden“ klicken.",
+            )
+            return
+        if missing:
+            names = ", ".join(DEVICE_LABELS[m] for m in missing)
+            reply = QMessageBox.warning(
+                self,
+                "Kamera nicht bereit",
+                f"{names} ist nicht bereit:\n"
+                + "\n".join(f"• {DEVICE_LABELS[m]}: {self.session.status(m)[1]}" for m in missing)
+                + "\n\nEmpfohlen: Abbrechen und „Neu verbinden“ klicken.\n"
+                "Trotzdem nur mit den übrigen Kameras aufnehmen?",
+                QMessageBox.Yes | QMessageBox.Cancel,
+                QMessageBox.Cancel,
+            )
+            if reply != QMessageBox.Yes:
                 return
 
-            self._showing_dialog = True
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        if self.file_name == f"recording_{self.card_id}" or not self.file_name:
+            category_name = os.path.basename(self.save_dir)
+            self.file_name = "".join(
+                c for c in f"{category_name}_{timestamp}" if c.isalnum() or c in "_-"
+            )
+            self.file_label.setText(self.file_name)
+        os.makedirs(self.save_dir, exist_ok=True)
 
+        use_ext_mic = self.external_mic_enabled and self.external_mic_id is not None
+        # ALSA kann meist nicht zwei Audio-Streams parallel -> Standard-Mikro aus
+        webcam_audio = False if use_ext_mic else self.audio_enabled
+
+        results = self.session.start_recording(
+            self.save_dir, self.file_name, use_dvs=self.use_dvs, webcam_audio=webcam_audio
+        )
+        failed = {d: msg for d, (ok, msg) in results.items() if not ok}
+        unexpected = {d: m for d, m in failed.items() if d not in missing}
+        if not self.session.recording:
+            QMessageBox.critical(
+                self,
+                "Aufnahme fehlgeschlagen",
+                "Die Aufnahme konnte nicht gestartet werden:\n"
+                + "\n".join(f"• {DEVICE_LABELS[d]}: {m}" for d, m in failed.items()),
+            )
+            return
+        if unexpected:
+            QMessageBox.warning(
+                self,
+                "Teilweise gestartet",
+                "Achtung, nicht alle Kameras nehmen auf:\n"
+                + "\n".join(f"• {DEVICE_LABELS[d]}: {m}" for d, m in unexpected.items()),
+            )
+
+        self.webcam_recording = bool(results.get("webcam", (False,))[0])
+
+        if use_ext_mic:
+            path = os.path.join(self.save_dir, f"{self.file_name}_audio.wav")
+            self.external_audio_recorder = ExternalAudioRecorder(path, self.external_mic_id)
+            webcam = self.session.webcam
+            if webcam is not None and webcam.start_time:
+                self.external_audio_recorder.set_start_time(webcam.start_time)
+            self.external_audio_recorder.start()
+
+        self.recording = True
+        self._record_started_at = datetime.datetime.now()
+        self.alert_label.setVisible(False)
+        active = [DEVICE_LABELS[d] for d, (ok, _) in results.items() if ok]
+        self.status_label.setText("● Aufnahme läuft: " + " + ".join(active))
+        self.status_label.setStyleSheet("color:#dc3545; font-weight:bold;")
+        self.record_button.setText("■ Aufnahme stoppen")
+        self.record_button.setStyleSheet(
+            "font-size:15px; font-weight:bold; background:#dc3545; color:white;"
+        )
+        self.zoom_slider.setEnabled(False)
+        self.recording_state_changed.emit(self.card_id, True)
+
+    def _stop_recording(self):
+        self.record_button.setEnabled(False)
+        self.status_label.setText("Aufnahme wird gestoppt…")
+        self.status_label.setStyleSheet("")
+        QApplication.processEvents()
+
+        if self.external_audio_recorder is not None:
+            self.external_audio_recorder.stop()
+            self.external_audio_recorder = None
+
+        self.awaiting_processing = self.webcam_recording
+        results = self.session.stop_recording()
+        self.recording = False
+        self._record_started_at = None
+        self.record_button.setText("Aufnahme starten")
+        self.record_button.setStyleSheet("font-size:15px; font-weight:bold;")
+        self.record_button.setEnabled(True)
+        self.zoom_slider.setEnabled(True)
+        self.recording_state_changed.emit(self.card_id, False)
+
+        dvs_ok, dvs_msg = results.get("dvs", (True, ""))
+        if not dvs_ok:
+            QMessageBox.warning(self, "DVS", f"DVS-Aufnahme konnte nicht sauber beendet werden:\n{dvs_msg}")
+
+        if not self.awaiting_processing:
+            # Ohne Webcam-Video gibt es keine Nachverarbeitung -> direkt bewerten
+            self.status_label.setText("Aufnahme gespeichert")
+            QTimer.singleShot(100, self.show_rating_dialog)
+
+    def on_recording_interrupted(self, message):
+        if not self.recording:
+            return
+        self.alert_label.setText(f"⚠ {message}")
+        self.alert_label.setVisible(True)
+        QApplication.beep()
+
+    def on_processing_status(self, status_msg):
+        if not self.awaiting_processing:
+            return
+        self.status_label.setText(status_msg)
+        if "Verarbeite" in status_msg or "Konvertiere" in status_msg:
+            self.processing = True
+            self.progress_bar.setVisible(True)
+            self.record_button.setEnabled(False)
+            self.zoom_slider.setEnabled(False)
+        elif "erfolgreich" in status_msg or "gespeichert" in status_msg:
+            self.processing = False
+            self.awaiting_processing = False
+            self.progress_bar.setVisible(False)
+            self.record_button.setEnabled(True)
+            self.zoom_slider.setEnabled(True)
+            QTimer.singleShot(100, self.show_rating_dialog)
+
+    def _tick(self):
+        if self._record_started_at is not None:
+            secs = int((datetime.datetime.now() - self._record_started_at).total_seconds())
+            self.duration_label.setText(f"{secs // 60:02d}:{secs % 60:02d}")
+
+    def show_rating_dialog(self):
+        if self._showing_dialog or self.is_closing:
+            return
+        self._showing_dialog = True
+        try:
             dialog = RatingDialog(
                 category=self.category,
                 save_dir=self.save_dir,
                 file_name=self.file_name,
                 parent=self,
             )
-
-            dialog.rating_saved.connect(
-                lambda: self.recording_completed.emit(self.card_id)
-            )
-
-            result = dialog.exec_()
-
-            if result == QDialog.Accepted:
-                print(f"Bewertung wurde gespeichert")
-                self.status_label.setText(
-                    "Bewertung gespeichert - Segment abgeschlossen"
-                )
+            dialog.rating_saved.connect(lambda: self.recording_completed.emit(self.card_id))
+            if dialog.exec_() == QDialog.Accepted:
+                self.status_label.setText("Bewertung gespeichert – Punkt abgeschlossen")
             else:
-                print(f"Bewertung wurde abgebrochen")
                 self.status_label.setText("Bewertung abgebrochen")
-
+        finally:
             self._showing_dialog = False
 
-        except Exception as e:
-            print(f"FEHLER beim Anzeigen des Bewertungsdialogs: {e}")
-            import traceback
+    # ---------------------------------------------------------- Schließen
 
-            traceback.print_exc()
-            self._showing_dialog = False
+    def closeEvent(self, event):
+        if not self.is_closing:
+            event.ignore()
+            self.safe_close()
+        else:
+            super().closeEvent(event)
+
+    def safe_close(self):
+        if self.processing:
+            reply = QMessageBox.question(
+                self,
+                "Video wird verarbeitet",
+                "Das Video wird gerade gespeichert. Trotzdem schließen?\n"
+                "Die Speicherung läuft im Hintergrund weiter, die Bewertung "
+                "muss dann über „Erneut aufnehmen“ nachgeholt werden.",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if reply == QMessageBox.No:
+                return
+        if self.recording:
+            self._stop_recording()
+        self._clock.stop()
+        self._disconnect_session()
+        self.is_closing = True
+        self.close()

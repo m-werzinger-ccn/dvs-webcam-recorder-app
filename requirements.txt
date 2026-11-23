@@ -1,0 +1,8 @@
+# Python-Pakete der Aufnahme-App.
+# Das Metavision SDK (DVS) kommt NICHT von pip, sondern per apt von Prophesee
+# (nur Ubuntu 22.04/24.04, amd64). Deshalb die venv mit --system-site-packages anlegen.
+PyQt5>=5.15
+opencv-python>=4.6
+numpy
+pyaudio
+reportlab

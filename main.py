@@ -16,7 +16,6 @@ from PyQt5.QtCore import Qt
 import config
 from utils import (
     create_desktop_shortcut,
-    get_available_cameras,
     check_available_codecs,
     get_best_codec,
 )

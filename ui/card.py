@@ -21,7 +21,6 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtGui import QFont
 
-from ui.camera_view import CameraView
 from ui.dual_camera_view import DualCameraView
 import config
 
@@ -29,10 +28,10 @@ import config
 class RecordingCard(QFrame):
     """Eine Karte für jeden Aufnahmekanal"""
 
-    def __init__(self, card_id, camera_id=0, save_dir=""):
+    def __init__(self, card_id, session, save_dir=""):
         super().__init__()
         self.card_id = card_id
-        self.camera_id = camera_id
+        self.session = session
         self.save_dir = save_dir
         self.recording = False
         self.audio_enabled = True  # Standard: Audio aktiviert
@@ -61,9 +60,8 @@ class RecordingCard(QFrame):
         # ÄNDERUNG: Standard auf Dual-Kamera setzen
         self.camera_mode = self.DUAL_CAMERA
 
-        # Kamera-Ansichten (werden erst erstellt, wenn angeklickt)
-        self.camera_view = None
-        self.dual_camera_view = None
+        # Aufnahmefenster (wird erst erstellt, wenn angeklickt)
+        self.view = None
 
         # Flag für abgeschlossene Aufnahmen
         self.completed = False
@@ -202,53 +200,27 @@ class RecordingCard(QFrame):
             # Verzeichnis existiert nicht oder kann nicht zugegriffen werden
             return False
 
-    def set_camera_id(self, camera_id):
-        """Setzt die Kamera-ID"""
-        self.camera_id = camera_id
-        # Kamera-Ansicht aktualisieren, falls sie bereits geöffnet ist
-        if self.camera_view is not None:
-            self.camera_view.close()
-            self.camera_view = None
-        if self.dual_camera_view is not None:
-            self.dual_camera_view.close()
-            self.dual_camera_view = None
+    def close_view(self):
+        """Schließt ein offenes Aufnahmefenster dieser Karte."""
+        if self.view is not None:
+            self.view.close()
+            self.view = None
 
     def set_save_directory(self, directory):
-        """Setzt das Speicherverzeichnis"""
         self.save_dir = directory
-        # Speicherverzeichnis der Kamera-Ansicht aktualisieren, falls vorhanden
-        if self.camera_view is not None:
-            self.camera_view.set_save_directory(directory)
-        if self.dual_camera_view is not None:
-            self.dual_camera_view.set_save_directory(directory)
+        if self.view is not None:
+            self.view.set_save_directory(directory)
 
     def set_audio_enabled(self, enabled):
-        """Aktiviert oder deaktiviert die Audioaufnahme"""
         self.audio_enabled = enabled
-        # Audio-Einstellung der Kamera-Ansicht aktualisieren, falls vorhanden
-        if self.camera_view is not None and hasattr(
-            self.camera_view, "set_audio_enabled"
-        ):
-            self.camera_view.set_audio_enabled(enabled)
-        if self.dual_camera_view is not None and hasattr(
-            self.dual_camera_view, "set_audio_enabled"
-        ):
-            self.dual_camera_view.set_audio_enabled(enabled)
+        if self.view is not None:
+            self.view.set_audio_enabled(enabled)
 
     def set_external_mic(self, enabled, mic_id=None):
-        """Setzt die externen Mikrofon-Einstellungen"""
-        print(f"[Card {self.card_id}] set_external_mic: enabled={enabled}, mic_id={mic_id}")
         self.external_mic_enabled = enabled
         self.external_mic_id = mic_id
-        # Externe Mikrofon-Einstellung der Kamera-Ansicht aktualisieren, falls vorhanden
-        if self.camera_view is not None and hasattr(
-            self.camera_view, "set_external_mic"
-        ):
-            self.camera_view.set_external_mic(enabled, mic_id)
-        if self.dual_camera_view is not None and hasattr(
-            self.dual_camera_view, "set_external_mic"
-        ):
-            self.dual_camera_view.set_external_mic(enabled, mic_id)
+        if self.view is not None:
+            self.view.set_external_mic(enabled, mic_id)
 
     def change_file_name(self):
         """Erlaubt dem Benutzer, den Dateinamen zu ändern"""
@@ -258,107 +230,41 @@ class RecordingCard(QFrame):
             "Neuer Dateiname (ohne Erweiterung):",
             text=self.file_name,
         )
-
         if ok and new_name:
             self.file_name = new_name
             self.name_label.setText(self.file_name)
-
-            # Dateinamen der Kamera-Ansicht aktualisieren, falls vorhanden
-            if self.camera_view is not None:
-                self.camera_view.set_file_name(new_name)
-            if self.dual_camera_view is not None:
-                self.dual_camera_view.set_file_name(new_name)
+            if self.view is not None:
+                self.view.set_file_name(new_name)
 
     def on_mode_changed(self, index):
-        """Wird aufgerufen, wenn sich der Kamera-Modus ändert"""
         if index >= 0:
             self.camera_mode = self.mode_combo.itemData(index)
-            # Bestehende Ansichten schließen
-            if self.camera_view is not None:
-                self.camera_view.close()
-                self.camera_view = None
-            if self.dual_camera_view is not None:
-                self.dual_camera_view.close()
-                self.dual_camera_view = None
+            self.close_view()
 
     def open_camera_view(self):
-        """Öffnet das entsprechende Kameraansichts-Fenster je nach gewähltem Modus"""
-        # Erstelle einen kategoriebasierten Speicherpfad
+        """Öffnet das Aufnahmefenster (Webcam + DVS oder nur Webcam)."""
         safe_title = self.title.replace(" ", "_").replace(".", "_")
         category_dir = os.path.join(self.save_dir, safe_title)
-
-        # Stelle sicher, dass der Kategorie-Ordner existiert
         try:
             os.makedirs(category_dir, exist_ok=True)
         except Exception as e:
             print(f"Fehler beim Erstellen des Kategorieordners: {e}")
 
-        # Schließe bestehende Ansichten, bevor neue erstellt werden
-        if self.camera_view is not None:
-            self.camera_view.close()
-            self.camera_view = None
-        if self.dual_camera_view is not None:
-            self.dual_camera_view.close()
-            self.dual_camera_view = None
-
-        if self.camera_mode == self.WEBCAM_ONLY:
-            # Einfache Webcam-Ansicht
-            self.camera_view = CameraView(
-                self.card_id,
-                self.camera_id,
-                category_dir,  # Hier den kategoriebasierten Pfad übergeben
-                self.file_name,
-            )
-            # Audio-Einstellung setzen
-            if hasattr(self.camera_view, "set_audio_enabled"):
-                self.camera_view.set_audio_enabled(self.audio_enabled)
-
-            # Externes Mikrofon-Einstellung setzen
-            if hasattr(self.camera_view, "set_external_mic"):
-                self.camera_view.set_external_mic(
-                    self.external_mic_enabled, self.external_mic_id
-                )
-
-            self.camera_view.recording_state_changed.connect(
-                self.on_recording_state_changed
-            )
-            # Connect the new signal
-            self.camera_view.recording_completed.connect(self.on_recording_completed)
-
-            # Ansicht anzeigen
-            self.camera_view.show()
-            self.camera_view.raise_()
-            self.camera_view.activateWindow()
-        else:
-            # Duale Kamera-Ansicht
-            self.dual_camera_view = DualCameraView(
-                self.card_id,
-                self.camera_id,
-                category_dir,  # Hier den kategoriebasierten Pfad übergeben
-                self.file_name,
-            )
-            # Audio-Einstellung setzen
-            if hasattr(self.dual_camera_view, "set_audio_enabled"):
-                self.dual_camera_view.set_audio_enabled(self.audio_enabled)
-
-            # Externes Mikrofon-Einstellung setzen
-            if hasattr(self.dual_camera_view, "set_external_mic"):
-                self.dual_camera_view.set_external_mic(
-                    self.external_mic_enabled, self.external_mic_id
-                )
-
-            self.dual_camera_view.recording_state_changed.connect(
-                self.on_recording_state_changed
-            )
-            # Connect the new signal
-            self.dual_camera_view.recording_completed.connect(
-                self.on_recording_completed
-            )
-
-            # Ansicht anzeigen
-            self.dual_camera_view.show()
-            self.dual_camera_view.raise_()
-            self.dual_camera_view.activateWindow()
+        self.close_view()
+        self.view = DualCameraView(
+            self.card_id,
+            self.session,
+            category_dir,
+            self.file_name,
+            use_dvs=(self.camera_mode == self.DUAL_CAMERA),
+        )
+        self.view.set_audio_enabled(self.audio_enabled)
+        self.view.set_external_mic(self.external_mic_enabled, self.external_mic_id)
+        self.view.recording_state_changed.connect(self.on_recording_state_changed)
+        self.view.recording_completed.connect(self.on_recording_completed)
+        self.view.show()
+        self.view.raise_()
+        self.view.activateWindow()
 
     def on_recording_state_changed(self, card_id, is_recording):
         """Wird aufgerufen, wenn sich der Aufnahmestatus ändert"""

@@ -23,12 +23,14 @@ from PyQt5.QtWidgets import (
     QStatusBar,
     QFrame,
 )
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QSettings
 from PyQt5.QtGui import QFont
 
 from ui.card import RecordingCard
 from ui.patient_dialog import PatientDialog
-from utils import get_available_cameras
+from utils.devices import list_cameras
+from recorder.camera_session import CameraSession
+from ui.status_panel import DeviceStatusPanel
 from config import WINDOW_WIDTH, WINDOW_HEIGHT, EXAMINATION_CATEGORIES
 
 # Der Import von pdf_generator erfolgt dynamisch in der generate_report Methode
@@ -42,7 +44,9 @@ class MainWindow(QMainWindow):
         self.cards = []
         self.save_directory = ""
         self.available_cameras = []
-        self.selected_camera_id = 0
+        self.selected_camera = None
+        self.session = None
+        self.settings = QSettings("STRAIVER", "UntersuchungsRecorder")
 
         # Patientendaten
         self.patient_name = ""
@@ -115,34 +119,47 @@ class MainWindow(QMainWindow):
             sys.exit(0)
 
     def scan_cameras(self):
-        """Sucht nach verfügbaren Kameras"""
-        self.available_cameras = get_available_cameras()
+        """Sucht Webcams; bevorzugt die zuletzt verwendete, sonst UGREEN."""
+        self.available_cameras = list_cameras()
+        print(f"Gefundene Webcams: {[c.name for c in self.available_cameras]}")
+        self.selected_camera = self._pick_camera(
+            self.settings.value("webcam_key", "", type=str)
+        )
 
+    def _pick_camera(self, preferred_key):
+        for cam in self.available_cameras:
+            if cam.key == preferred_key:
+                return cam
+        return self.available_cameras[0] if self.available_cameras else None
+
+    def _fill_camera_combo(self):
+        self.camera_combo.blockSignals(True)
+        self.camera_combo.clear()
         if not self.available_cameras:
-            QMessageBox.warning(
-                self,
-                "Warnung",
-                "Keine Kamera gefunden! Die Anwendung wird starten, aber es können keine Aufnahmen gemacht werden.",
-            )
-            print("Keine Kamera gefunden!")
+            self.camera_combo.addItem("Keine Webcam gefunden", -1)
+            self.camera_combo.setEnabled(False)
         else:
-            print(f"Gefundene Kameras: {self.available_cameras}")
-            # ÄNDERUNG: Erste verfügbare Kamera als Standard auswählen
-            # (get_available_cameras() sortiert UGREEN-Kameras bereits an den Anfang)
-            self.selected_camera_id = self.available_cameras[0][0]
-
-            # Info-Ausgabe, welche Kamera als Standard gewählt wurde
-            selected_camera_name = self.available_cameras[0][1]
-            if "ugreen" in selected_camera_name.lower():
-                print(
-                    f"UGREEN-Kamera automatisch als Standard ausgewählt: {selected_camera_name}"
-                )
-            else:
-                print(f"Standard-Kamera ausgewählt: {selected_camera_name}")
+            self.camera_combo.setEnabled(True)
+            for i, cam in enumerate(self.available_cameras):
+                self.camera_combo.addItem(cam.name, i)
+                if self.selected_camera is not None and cam.key == self.selected_camera.key:
+                    self.camera_combo.setCurrentIndex(i)
+        self.camera_combo.blockSignals(False)
 
     def init_ui(self):
         """Initialisiert die Benutzeroberfläche"""
         self.setWindowTitle(f"Medizinische Untersuchung - {self.patient_name}")
+
+        # Eine Kamera-Sitzung für die ganze Untersuchung: Kameras bleiben offen
+        self.session = CameraSession(
+            camera=self.selected_camera,
+            save_dir=self.save_directory,
+            audio_enabled=self.audio_enabled,
+            external_mic_enabled=self.external_mic_enabled,
+            external_mic_id=self.external_mic_id,
+            parent=self,
+        )
+        self.session.start()
         self.setMinimumSize(WINDOW_WIDTH, WINDOW_HEIGHT)
 
         # Hauptwidget und Layout
@@ -203,28 +220,28 @@ class MainWindow(QMainWindow):
 
         main_layout.addWidget(patient_frame)
 
+        # Gerätestatus (Ampel) mit "Neu verbinden"
+        status_group = QFrame()
+        status_layout = QVBoxLayout(status_group)
+        status_layout.setContentsMargins(0, 0, 0, 0)
+        status_title = QLabel("<b>Gerätestatus</b> – alles grün = bereit zur Aufnahme")
+        status_layout.addWidget(status_title)
+        self.status_panel = DeviceStatusPanel(self.session)
+        status_layout.addWidget(self.status_panel)
+        main_layout.addWidget(status_group)
+
         # Kamera-Auswahl
         camera_layout = QHBoxLayout()
-        camera_layout.addWidget(QLabel("Kamera:"))
+        camera_layout.addWidget(QLabel("Webcam:"))
 
         self.camera_combo = QComboBox()
-        # Kamera-Liste füllen
-        for cam_id, cam_name in self.available_cameras:
-            self.camera_combo.addItem(cam_name, cam_id)
-
-        # Falls keine Kameras gefunden wurden, deaktivieren und leeren Eintrag hinzufügen
-        if not self.available_cameras:
-            self.camera_combo.addItem("Keine Kamera gefunden", -1)
-            self.camera_combo.setEnabled(False)
-        else:
-            # ÄNDERUNG: Standardmäßig die erste Kamera auswählen (UGREEN steht bereits an erster Stelle)
-            self.camera_combo.setCurrentIndex(0)
-
+        self.camera_combo.setMinimumWidth(320)
+        self._fill_camera_combo()
         self.camera_combo.currentIndexChanged.connect(self.on_camera_changed)
         camera_layout.addWidget(self.camera_combo)
 
         # Aktualisieren-Button
-        self.refresh_button = QPushButton("Kameras aktualisieren")
+        self.refresh_button = QPushButton("Webcams neu suchen")
         self.refresh_button.clicked.connect(self.refresh_cameras)
         camera_layout.addWidget(self.refresh_button)
 
@@ -254,7 +271,7 @@ class MainWindow(QMainWindow):
             row = i // cols
             col = i % cols
 
-            card = RecordingCard(i, self.selected_camera_id, self.save_directory)
+            card = RecordingCard(i, self.session, self.save_directory)
 
             # Audio-Einstellung an die Karten weitergeben
             if hasattr(card, "set_audio_enabled"):
@@ -434,15 +451,7 @@ class MainWindow(QMainWindow):
         )
 
         if reply == QMessageBox.Yes:
-            # Alle Kamera-Ansichten schließen
-            for card in self.cards:
-                if hasattr(card, "camera_view") and card.camera_view is not None:
-                    card.camera_view.close()
-                if (
-                    hasattr(card, "dual_camera_view")
-                    and card.dual_camera_view is not None
-                ):
-                    card.dual_camera_view.close()
+            self._shutdown()
 
             # Aktuelles Fenster schließen
             self.close()
@@ -452,63 +461,51 @@ class MainWindow(QMainWindow):
             os.execl(python, python, *sys.argv)
 
     def on_camera_changed(self, index):
-        """Wird aufgerufen, wenn eine andere Kamera ausgewählt wird"""
-        if index >= 0 and index < len(self.available_cameras):
-            self.selected_camera_id = self.available_cameras[index][0]
-            print(
-                f"Kamera gewechselt zu: {self.available_cameras[index][1]} (ID: {self.selected_camera_id})"
-            )
-
-            # Kamera-ID in allen Karten aktualisieren
-            for card in self.cards:
-                card.set_camera_id(self.selected_camera_id)
+        """Andere Webcam gewählt."""
+        cam_index = self.camera_combo.itemData(index)
+        if cam_index is None or cam_index < 0 or cam_index >= len(self.available_cameras):
+            return
+        cam = self.available_cameras[cam_index]
+        if self.session is not None and not self.session.set_camera(cam):
+            QMessageBox.warning(self, "Webcam", "Während einer Aufnahme kann die Webcam nicht gewechselt werden.")
+            self._fill_camera_combo()
+            return
+        self.selected_camera = cam
+        self.settings.setValue("webcam_key", cam.key)
+        print(f"Webcam gewechselt zu: {cam.name}")
 
     def refresh_cameras(self):
-        """Aktualisiert die Liste der verfügbaren Kameras"""
-        previous_camera_id = self.selected_camera_id
+        """Sucht die Webcams neu (z. B. nach dem Einstecken)."""
+        previous = self.selected_camera
+        self.available_cameras = list_cameras()
+        self.selected_camera = self._pick_camera(previous.key if previous else "")
+        self._fill_camera_combo()
+        if self.session is None:
+            return
+        if self.selected_camera is None:
+            QMessageBox.warning(self, "Webcam", "Keine Webcam gefunden. Bitte Kabel und USB-Hub prüfen.")
+        elif previous is None or previous.key != self.selected_camera.key \
+                or not self.session.is_ready("webcam"):
+            self.session.reconnect_webcam(self.selected_camera)
 
-        # Liste der verfügbaren Kameras aktualisieren
-        self.available_cameras = get_available_cameras()
-
-        # ComboBox aktualisieren
-        self.camera_combo.clear()
-
-        if not self.available_cameras:
-            self.camera_combo.addItem("Keine Kamera gefunden", -1)
-            self.camera_combo.setEnabled(False)
-            QMessageBox.warning(self, "Warnung", "Keine Kamera gefunden!")
-        else:
-            self.camera_combo.setEnabled(True)
-
-            # ComboBox mit Kameras füllen
-            selected_index = 0
-            for i, (cam_id, cam_name) in enumerate(self.available_cameras):
-                self.camera_combo.addItem(cam_name, cam_id)
-
-                # Vorherige Kamera wiederfinden
-                if cam_id == previous_camera_id:
-                    selected_index = i
-
-            # ÄNDERUNG: Prüfen, ob UGREEN-Kamera verfügbar ist und diese bevorzugen
-            # (get_available_cameras() sortiert UGREEN bereits an den Anfang)
-            if self.available_cameras:
-                first_camera_name = self.available_cameras[0][1]
-                if "ugreen" in first_camera_name.lower():
-                    selected_index = 0  # UGREEN-Kamera steht bereits an erster Stelle
-                    print(f"UGREEN-Kamera automatisch ausgewählt: {first_camera_name}")
-
-            # Kamera auswählen
-            self.camera_combo.setCurrentIndex(selected_index)
-            self.selected_camera_id = self.available_cameras[selected_index][0]
+    def _shutdown(self):
+        for card in self.cards:
+            card.close_view()
+        if self.session is not None:
+            self.session.stop()
+            self.session = None
 
     def closeEvent(self, event):
-        """Wird aufgerufen, wenn das Fenster geschlossen wird"""
-        # Alle Kamera-Ansichten schließen
-        for card in self.cards:
-            if hasattr(card, "camera_view") and card.camera_view is not None:
-                card.camera_view.close()
-            if hasattr(card, "dual_camera_view") and card.dual_camera_view is not None:
-                card.dual_camera_view.close()
-
-        # Event weiterleiten
+        if self.session is not None and self.session.recording:
+            reply = QMessageBox.question(
+                self,
+                "Aufnahme läuft",
+                "Es läuft noch eine Aufnahme. Wirklich beenden? Die Aufnahme wird gestoppt.",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                event.ignore()
+                return
+        self._shutdown()
         super().closeEvent(event)

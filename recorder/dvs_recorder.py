@@ -2,21 +2,29 @@
 # -*- coding: utf-8 -*-
 
 """
-DVS-Kamera-Recorder für die Webcam-Aufnahme-Anwendung.
-Verwendet Metavision SDK zur Aufnahme von Ereignissen einer DVS-Kamera.
-Direkt basierend auf den Beispielen des Herstellers.
+DVS-Kamera-Recorder (Prophesee, Metavision SDK).
+
+Aufbau für Stabilität:
+- Alle Zugriffe auf das Gerät passieren ausschließlich im Worker-Thread.
+  Start/Stopp der Aufnahme werden als Befehl in den Thread gereicht.
+- Kann die Kamera nicht geöffnet werden oder bricht die Verbindung ab, wird
+  automatisch alle paar Sekunden neu verbunden – kein Umstecken nötig.
+- Der Zustand wird über status_changed(state, detail) gemeldet:
+  "connecting" | "ok" | "error" | "unavailable".
+- Bricht die Verbindung während einer Aufnahme ab, kommt recording_interrupted.
 """
 
+import gc
 import os
-import cv2
-import time
+import queue
 import threading
-import numpy as np
-from PyQt5.QtCore import Qt, QThread, pyqtSignal
-from PyQt5.QtGui import QImage
-from PyQt5.QtWidgets import QMessageBox, QApplication
+import time
 
-# Metavision SDK Imports
+import cv2
+import numpy as np
+from PyQt5.QtCore import QThread, pyqtSignal
+from PyQt5.QtGui import QImage
+
 try:
     from metavision_core.event_io import EventsIterator
     from metavision_core.event_io.raw_reader import initiate_device
@@ -24,296 +32,237 @@ try:
 
     HAS_METAVISION = True
 except ImportError:
-    print(
-        "Warnung: Metavision SDK nicht gefunden. DVS-Kamera-Funktionalität deaktiviert."
-    )
     HAS_METAVISION = False
+
+RETRY_INTERVAL_S = 3.0
+PREVIEW_FPS = 25
 
 
 class DVSRecorder(QThread):
-    """Thread für die DVS-Kamera-Aufnahme mit Metavision SDK"""
+    """Thread für Vorschau und RAW-Aufnahme der DVS-Kamera."""
 
     update_frame = pyqtSignal(QImage)
+    status_changed = pyqtSignal(str, str)  # state, detail
     error_signal = pyqtSignal(str)
+    recording_interrupted = pyqtSignal(str)
 
-    def __init__(self, save_dir="", file_name=""):
+    def __init__(self, serial=""):
         super().__init__()
-        self.save_dir = save_dir
-        self.file_name = file_name
+        self.serial = serial
         self.running = False
         self.recording = False
+        self.raw_path = ""
+        self.width, self.height = 1280, 720
+        self.state = "connecting"
+        self.state_detail = ""
 
-        # Für Thread-Sicherheit
-        self.mutex = threading.Lock()
+        self._commands = queue.Queue()
+        # Zeitpunkt des letzten echten Kamerabilds (für die Hänger-Erkennung)
+        self.last_frame_time = 0.0
 
-        # Metavision-spezifische Attribute
-        self.device = None
-        self.mv_iterator = None
-        self.event_frame_gen = None
-        self.width = 640  # Standardwerte
-        self.height = 480  # Standardwerte
-        self.fps = 25
+        self._event_count = 0
+        self._rate_t0 = time.monotonic()
+        self.event_rate_mev = 0.0
 
-        # Dummy-Frame für den Fall, dass keine Kamera verfügbar ist
-        self.dummy_frame = np.zeros((480, 640, 3), dtype=np.uint8)
-        cv2.putText(
-            self.dummy_frame,
-            "Keine DVS-Kamera verfügbar",
-            (100, 240),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1,
-            (255, 255, 255),
-            2,
-        )
+    # ------------------------------------------------------------------ Status
 
-        # Prüfen, ob Metavision verfügbar ist
-        if not HAS_METAVISION:
-            self.error_signal.emit(
-                "Metavision SDK nicht installiert. DVS-Kamera nicht verfügbar."
-            )
+    def _set_state(self, state, detail=""):
+        if (state, detail) != (self.state, self.state_detail):
+            self.state, self.state_detail = state, detail
+            self.status_changed.emit(state, detail)
+
+    def is_ready(self):
+        return self.state == "ok"
+
+    # --------------------------------------------------------- Hauptschleife
 
     def run(self):
-        """Hauptschleife für die DVS-Kamera-Aufnahme"""
-        try:
-            # Thread als laufend markieren
-            self.running = True
+        self.running = True
 
-            if not HAS_METAVISION:
-                # Wenn Metavision nicht verfügbar ist, nur Dummy-Frames senden
-                while self.running:
-                    self._send_dummy_frame()
-                    time.sleep(0.04)  # ca. 25 FPS
-                return
+        if not HAS_METAVISION:
+            self._set_state(
+                "unavailable",
+                "Metavision SDK nicht installiert – DVS auf diesem System nicht verfügbar",
+            )
+            self._idle_loop("DVS nicht verfügbar\n(Metavision SDK fehlt)")
+            return
 
-            # DVS-Kamera öffnen - DIREKTE IMPLEMENTIERUNG WIE IM BEISPIELCODE
+        attempt = 0
+        while self.running:
+            attempt += 1
+            self._set_state(
+                "connecting", "Verbinde…" if attempt == 1 else f"Verbinde… (Versuch {attempt})"
+            )
+            device = iterator = None
             try:
-                # Direkte Initialisierung des Geräts - wie im Recorder-Beispiel
-                self.device = initiate_device("")
-                if not self.device:
-                    raise Exception("Konnte kein DVS-Gerät initialisieren")
-
-                # Events iterator vom Gerät erstellen
-                self.mv_iterator = EventsIterator.from_device(device=self.device)
-                if not self.mv_iterator:
-                    raise Exception("Konnte keinen EventsIterator vom Gerät erstellen")
-
-                # Kamera-Geometrie auslesen
-                self.height, self.width = self.mv_iterator.get_size()
-
-                print(
-                    f"DVS-Kamera erfolgreich geöffnet mit Auflösung {self.width}x{self.height}"
-                )
-
-                # Event Frame Generator - Exakt wie im Beispielcode
-                self.event_frame_gen = PeriodicFrameGenerationAlgorithm(
-                    sensor_width=self.width,
-                    sensor_height=self.height,
-                    fps=self.fps,
-                    palette=ColorPalette.Dark,
-                )
-
-                # Callback für neue Frames setzen - Exakt wie im Beispielcode
-                self.event_frame_gen.set_output_callback(self._on_cd_frame_cb)
-
-                # Aufnahmeschleife - Exakt wie im Beispielcode
-                for evs in self.mv_iterator:
-                    if not self.running:
-                        break
-
-                    # Ereignisse verarbeiten - Wichtig: Keine Mutex-Sperre hier
-                    self.event_frame_gen.process_events(evs)
-
-                    # Kurze Pause für UI-Updates
-                    QApplication.processEvents()
-
+                device = initiate_device(self.serial)
+                if device is None:
+                    raise RuntimeError("Keine DVS-Kamera gefunden")
+                iterator = EventsIterator.from_device(device=device)
+                self.height, self.width = iterator.get_size()
+                attempt = 0
+                self._stream(device, iterator)
             except Exception as e:
-                self.error_signal.emit(
-                    f"Fehler bei der DVS-Kamera-Initialisierung: {e}"
-                )
-                print(f"Fehler bei der DVS-Kamera-Initialisierung: {e}")
-                import traceback
+                msg = str(e).strip() or e.__class__.__name__
+                print(f"[DVS] {msg}")
+                self._set_state("error", f"{msg} – neuer Versuch in {RETRY_INTERVAL_S:.0f} s")
+            finally:
+                self._stop_logging(device, interrupted=self.running)
+                # Gerät im selben Thread freigeben, bevor neu geöffnet wird
+                del iterator
+                del device
+                gc.collect()
 
-                traceback.print_exc()
+            if self.running:
+                self._send_placeholder("DVS-Kamera nicht verbunden\nVerbinde automatisch neu…")
+                self._sleep(RETRY_INTERVAL_S)
 
-                # Bei Fehler nur Dummy-Frames senden
-                while self.running:
-                    self._send_dummy_frame()
-                    time.sleep(0.04)  # ca. 25 FPS
+        self._set_state("connecting", "gestoppt")
 
-        except Exception as e:
-            self.error_signal.emit(f"Kritischer Fehler bei der DVS-Kameraaufnahme: {e}")
-            print(f"Kritischer Fehler bei der DVS-Kameraaufnahme: {e}")
-            import traceback
+    def _stream(self, device, iterator):
+        frame_gen = PeriodicFrameGenerationAlgorithm(
+            sensor_width=self.width,
+            sensor_height=self.height,
+            fps=PREVIEW_FPS,
+            palette=ColorPalette.Dark,
+        )
+        frame_gen.set_output_callback(self._on_frame)
+        self.last_frame_time = time.monotonic()
+        self._set_state("ok", f"{self.width}×{self.height}")
+        print(f"[DVS] verbunden: {self.width}x{self.height}")
 
-            traceback.print_exc()
-
-        finally:
-            # Ressourcen aufräumen
-            self._cleanup_resources()
-
-    def _on_cd_frame_cb(self, ts, cd_frame):
-        """Callback für neue Frames vom Event-Generator - Exakt wie im Beispielcode"""
-        try:
-            # Wenn das Thread nicht mehr läuft, abbrechen
+        for evs in iterator:
             if not self.running:
                 return
+            self._process_commands(device)
+            self._count_events(len(evs))
+            frame_gen.process_events(evs)
 
-            # DEBUG Ausgabe
-            print(f"DVS-Frame erhalten: Größe={cd_frame.shape}, Typ={cd_frame.dtype}")
+        # Iterator ist von selbst zu Ende gegangen -> Kamera weg
+        raise RuntimeError("Verbindung zur DVS-Kamera verloren")
 
-            # Frame für die GUI konvertieren (BGR zu RGB)
-            rgb_frame = cv2.cvtColor(cd_frame, cv2.COLOR_BGR2RGB)
-
-            # QImage erstellen
-            h, w = rgb_frame.shape[:2]
-            bytes_per_line = 3 * w
-
-            # Sicherstellen, dass die Daten kontinuierlich im Speicher liegen
-            if not rgb_frame.flags["C_CONTIGUOUS"]:
-                rgb_frame = np.ascontiguousarray(rgb_frame)
-
-            # Deep copy erstellen für thread-sichere Übergabe
-            qt_image = QImage(
-                rgb_frame.data, w, h, bytes_per_line, QImage.Format_RGB888
-            ).copy()
-
-            # Signal mit dem aktuellen Frame senden
-            print("DVS-Frame wird an GUI gesendet")
-            self.update_frame.emit(qt_image)
-
-        except Exception as e:
-            print(f"Fehler bei der Frame-Konvertierung: {e}")
-            import traceback
-
-            traceback.print_exc()
-            self._send_dummy_frame()
-
-    def _send_dummy_frame(self):
-        """Sendet ein Dummy-Frame, wenn keine echten Daten verfügbar sind"""
-        try:
-            # Kopie des Dummy-Frames erstellen und ggf. Aufnahmestatus hinzufügen
-            frame = self.dummy_frame.copy()
-
+    def _count_events(self, n):
+        self._event_count += n
+        now = time.monotonic()
+        if now - self._rate_t0 >= 1.0:
+            self.event_rate_mev = self._event_count / (now - self._rate_t0) / 1e6
+            self._event_count, self._rate_t0 = 0, now
+            detail = f"{self.width}×{self.height} · {self.event_rate_mev:.2f} Mev/s"
             if self.recording:
-                cv2.putText(
-                    frame,
-                    "● REC",
-                    (550, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    1,
-                    (0, 0, 255),
-                    2,
-                )
+                detail += " · REC"
+            self._set_state("ok", detail)
 
-            # Frame für die GUI konvertieren
-            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            h, w = rgb_frame.shape[:2]
-            bytes_per_line = 3 * w
-            qt_image = QImage(
-                rgb_frame.data, w, h, bytes_per_line, QImage.Format_RGB888
-            ).copy()
+    def _on_frame(self, ts, cd_frame):
+        if not self.running:
+            return
+        self.last_frame_time = time.monotonic()
+        rgb = cv2.cvtColor(cd_frame, cv2.COLOR_BGR2RGB)
+        self._emit_rgb(rgb)
 
-            # Signal mit dem aktuellen Frame senden
-            self.update_frame.emit(qt_image)
+    def _emit_rgb(self, rgb):
+        rgb = np.ascontiguousarray(rgb)
+        h, w = rgb.shape[:2]
+        self.update_frame.emit(QImage(rgb.data, w, h, 3 * w, QImage.Format_RGB888).copy())
 
-        except Exception as e:
-            print(f"Fehler beim Senden des Dummy-Frames: {e}")
+    def _send_placeholder(self, text):
+        frame = np.full((360, 640, 3), 40, dtype=np.uint8)
+        for i, line in enumerate(text.split("\n")):
+            cv2.putText(frame, line, (40, 170 + 40 * i), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.8, (230, 230, 230), 2)
+        self._emit_rgb(frame)
 
-    def start_recording(self, save_dir=None, file_name=None):
-        """Startet die DVS-Kamera-Aufnahme"""
-        if not self.running or self.recording:
-            return False
+    def _idle_loop(self, text):
+        while self.running:
+            self._fail_pending_commands("DVS nicht verfügbar")
+            self._send_placeholder(text)
+            self._sleep(1.0)
 
-        # Verwende die übergebenen Werte oder behalte die vorhandenen bei
-        if save_dir:
-            self.save_dir = save_dir
-        if file_name:
-            self.file_name = file_name
+    def _sleep(self, seconds):
+        end = time.monotonic() + seconds
+        while self.running and time.monotonic() < end:
+            self._fail_pending_commands("DVS-Kamera nicht verbunden")
+            time.sleep(0.05)
 
-        if not self.save_dir or not self.file_name:
-            self.error_signal.emit(
-                "Kein Speicherort oder Dateiname für DVS-Aufnahme angegeben!"
-            )
-            return False
+    # ------------------------------------------------------ Aufnahme-Befehle
 
-        # Wenn Metavision nicht verfügbar ist, abbrechen
-        if not HAS_METAVISION:
-            self.error_signal.emit(
-                "Metavision SDK nicht installiert. DVS-Aufnahme nicht möglich."
-            )
-            return False
+    def _process_commands(self, device):
+        while True:
+            try:
+                cmd, arg, reply = self._commands.get_nowait()
+            except queue.Empty:
+                return
+            ok, msg = False, ""
+            try:
+                stream = device.get_i_events_stream()
+                if cmd == "start":
+                    os.makedirs(os.path.dirname(arg), exist_ok=True)
+                    stream.log_raw_data(arg)
+                    self.raw_path, self.recording, ok = arg, True, True
+                    print(f"[DVS] Aufnahme gestartet: {arg}")
+                elif cmd == "stop":
+                    if self.recording:
+                        stream.stop_log_raw_data()
+                        print(f"[DVS] Aufnahme gestoppt: {self.raw_path}")
+                    self.recording, ok = False, True
+            except Exception as e:
+                msg = str(e)
+                print(f"[DVS] Befehl '{cmd}' fehlgeschlagen: {e}")
+            reply.put((ok, msg))
 
+    def _fail_pending_commands(self, msg):
+        while True:
+            try:
+                cmd, _, reply = self._commands.get_nowait()
+            except queue.Empty:
+                return
+            if cmd == "stop":
+                self.recording = False
+                reply.put((True, ""))
+            else:
+                reply.put((False, msg))
+
+    def _stop_logging(self, device, interrupted):
+        if not self.recording:
+            return
         try:
-            # Prüfen, ob die DVS-Kamera verfügbar ist
-            if not self.device or not self.device.get_i_events_stream():
-                self.error_signal.emit("Keine DVS-Kamera verfügbar für die Aufnahme!")
-                return False
+            if device is not None:
+                device.get_i_events_stream().stop_log_raw_data()
+        except Exception:
+            pass
+        self.recording = False
+        if interrupted:
+            msg = f"DVS-Verbindung während der Aufnahme verloren – Datei unvollständig: {os.path.basename(self.raw_path)}"
+            self.recording_interrupted.emit(msg)
+            self.error_signal.emit(msg)
 
-            # Sicherstellen, dass der Speicherordner existiert
-            os.makedirs(self.save_dir, exist_ok=True)
+    def _send_command(self, cmd, arg=None, timeout=5.0):
+        if not self.running or not self.isRunning():
+            return False, "DVS-Thread läuft nicht"
+        reply = queue.Queue()
+        self._commands.put((cmd, arg, reply))
+        try:
+            return reply.get(timeout=timeout)
+        except queue.Empty:
+            return False, "DVS-Kamera reagiert nicht"
 
-            # RAW-Datei für die Aufnahme vorbereiten - GENAU WIE IM BEISPIELCODE
-            raw_file_path = os.path.join(self.save_dir, f"{self.file_name}.raw")
-
-            # Aufnahme starten - GENAU WIE IM BEISPIELCODE
-            print(f"Starte DVS-Aufnahme nach {raw_file_path}")
-            self.device.get_i_events_stream().log_raw_data(raw_file_path)
-            self.recording = True
-            return True
-
-        except Exception as e:
-            self.error_signal.emit(f"Fehler beim Starten der DVS-Aufnahme: {e}")
-            print(f"Fehler beim Starten der DVS-Aufnahme: {e}")
-            import traceback
-
-            traceback.print_exc()
-            return False
+    def start_recording(self, save_dir, file_name):
+        """Startet die RAW-Aufnahme. Gibt (erfolg, meldung) zurück."""
+        if not self.is_ready():
+            return False, self.state_detail or "DVS-Kamera nicht bereit"
+        path = os.path.join(save_dir, f"{file_name}.raw")
+        return self._send_command("start", path)
 
     def stop_recording(self):
-        """Stoppt die laufende DVS-Aufnahme"""
-        try:
-            if self.recording and self.device and self.device.get_i_events_stream():
-                # Aufnahme stoppen - GENAU WIE IM BEISPIELCODE
-                print("Stoppe DVS-Aufnahme")
-                self.device.get_i_events_stream().stop_log_raw_data()
-                self.recording = False
-                return True
-        except Exception as e:
-            self.error_signal.emit(f"Fehler beim Stoppen der DVS-Aufnahme: {e}")
-            print(f"Fehler beim Stoppen der DVS-Aufnahme: {e}")
-            import traceback
+        if not self.recording:
+            return True, ""
+        return self._send_command("stop")
 
-            traceback.print_exc()
+    # ---------------------------------------------------------------- Ende
 
-        # Status zurücksetzen, auch wenn ein Fehler aufgetreten ist
-        self.recording = False
-        return False
-
-    def _cleanup_resources(self):
-        """Gibt alle Ressourcen frei"""
-        try:
-            # Aufnahme stoppen, falls sie läuft
-            if self.recording and self.device and self.device.get_i_events_stream():
-                try:
-                    self.device.get_i_events_stream().stop_log_raw_data()
-                except:
-                    pass
-                self.recording = False
-
-            # Metavision-Ressourcen freigeben
-            self.event_frame_gen = None
-            self.mv_iterator = None
-            self.device = None
-
-        except Exception as e:
-            print(f"Fehler beim Freigeben der DVS-Ressourcen: {e}")
-
-    def stop(self):
-        """Stoppt den Thread und gibt Ressourcen frei"""
+    def stop(self, timeout_ms=5000):
+        """Stoppt den Thread; das Gerät wird im Thread selbst freigegeben."""
+        if self.recording:
+            self.stop_recording()
         self.running = False
-
-        # Aufräumen
-        self._cleanup_resources()
-
-        # Auf Thread-Ende warten
-        self.wait()
+        if not self.wait(timeout_ms):
+            print("[DVS] Warnung: Thread hat sich nicht rechtzeitig beendet")

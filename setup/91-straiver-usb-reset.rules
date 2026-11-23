@@ -1,0 +1,4 @@
+# STRAIVER-Aufnahme-Laptop: Erlaubt der Gruppe plugdev, USB-Geräte (keine Hubs)
+# per Software ab- und wieder anzumelden. Das nutzt der Knopf „Neu verbinden“
+# in der App – wirkt wie Kabel aus- und einstecken.
+ACTION=="add", SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{bDeviceClass}!="09", RUN+="/bin/sh -c 'chgrp plugdev /sys%p/authorized && chmod g+w /sys%p/authorized'"
