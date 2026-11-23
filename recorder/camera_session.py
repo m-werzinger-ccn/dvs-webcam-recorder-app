@@ -61,6 +61,7 @@ class CameraSession(QObject):
         # Threads, die sich nicht rechtzeitig beendet haben (z. B. in einem
         # USB-Aufruf hängen). Referenz halten, sonst stürzt Qt beim Aufräumen ab.
         self._zombies = []
+        self._dvs_restart_deadline = 0.0
 
         self._watchdog = QTimer(self)
         self._watchdog.setInterval(1000)
@@ -88,9 +89,10 @@ class CameraSession(QObject):
                 t.wait(2000)
         self._zombies.clear()
 
-    def _retire(self, thread):
+    def _retire(self, thread, already_stopped=False):
         """Thread stoppen; hängt er, Signale trennen und Referenz behalten."""
-        thread.stop()
+        if not already_stopped:
+            thread.stop()
         if thread.isRunning():
             for sig in (thread.update_frame, thread.status_changed,
                         thread.recording_interrupted, thread.error_signal):
@@ -229,18 +231,41 @@ class CameraSession(QObject):
             self.dvs = None
 
     def reconnect_dvs(self):
-        """DVS-Thread neu starten; unter Linux vorher Software-USB-Reset."""
+        """
+        DVS neu verbinden. Ablauf:
+        1. Thread stoppen (hängt er in einem USB-Aufruf, wird er "geparkt").
+        2. USB-Port der Kamera zurücksetzen – das beendet auch den hängenden
+           Aufruf, und die Firmware startet sauber neu.
+        3. Erst wenn kein alter DVS-Thread mehr läuft, neu verbinden.
+           (Vorher öffnen kollidiert mit dem alten Zugriff -> Timeouts.)
+        """
         if self.recording:
             return False, "Während einer Aufnahme nicht möglich"
-        self._stop_dvs()
+        self._set_status("dvs", "connecting", "Wird neu verbunden…")
+        if self.dvs is not None:
+            old, self.dvs = self.dvs, None
+            old.running = False
+            if not old.wait(1500):
+                self._retire(old, already_stopped=True)
         messages = []
         for dev in find_prophesee_usb_devices():
             ok, msg = usb_reset(dev)
             if not ok:
                 messages.append(msg)
-        self._set_status("dvs", "connecting", "Wird neu verbunden…")
-        QTimer.singleShot(3000, self._start_dvs)
+        self._dvs_restart_deadline = time.monotonic() + 10.0
+        QTimer.singleShot(2500, self._start_dvs_when_free)
         return True, " ".join(messages)
+
+    def _start_dvs_when_free(self):
+        busy = [t for t in self._zombies if isinstance(t, DVSRecorder) and t.isRunning()]
+        if busy and time.monotonic() < self._dvs_restart_deadline:
+            QTimer.singleShot(500, self._start_dvs_when_free)
+            return
+        if busy:
+            print("[Session] Alter DVS-Thread hängt weiter – verbinde trotzdem neu")
+        self._zombies = [t for t in self._zombies if t.isRunning()]
+        if self.dvs is None:
+            self._start_dvs()
 
     # ------------------------------------------------------------------- Zoom
 

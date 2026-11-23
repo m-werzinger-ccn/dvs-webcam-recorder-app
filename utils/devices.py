@@ -13,6 +13,7 @@ Windows: DirectShow-Indizes.
 Außerdem: Software-USB-Reset (Linux), damit niemand Kabel umstecken muss.
 """
 
+import fcntl
 import glob
 import os
 import platform
@@ -243,11 +244,34 @@ def usb_speed_mbit(usb_dir):
         return 0
 
 
+USBDEVFS_RESET = 0x5514  # _IO('U', 20) aus linux/usbdevice_fs.h
+
+
+def usb_port_reset(usb_dir):
+    """
+    Setzt den USB-Port eines Geräts zurück (wie das Tool 'usbreset').
+    Die Kamera-Firmware startet dabei neu – das löst auch festgefahrene
+    Zustände, die ein reines Ab-/Anmelden nicht löst. Braucht Schreibrecht
+    auf /dev/bus/usb/BBB/DDD (für Prophesee-Kameras setzen das die
+    Prophesee-udev-Regeln).
+    """
+    bus = int(_read(os.path.join(usb_dir, "busnum"), "0") or 0)
+    dev = int(_read(os.path.join(usb_dir, "devnum"), "0") or 0)
+    if not bus or not dev:
+        raise OSError("Bus-/Gerätenummer nicht lesbar")
+    fd = os.open(f"/dev/bus/usb/{bus:03d}/{dev:03d}", os.O_WRONLY)
+    try:
+        fcntl.ioctl(fd, USBDEVFS_RESET, 0)
+    finally:
+        os.close(fd)
+
+
 def usb_reset(usb_dir, off_seconds=1.0):
     """
-    Meldet ein USB-Gerät per Software ab und wieder an – wirkt wie Aus- und
-    Einstecken. Benötigt Schreibrecht auf <usb_dir>/authorized
-    (siehe setup/91-straiver-usb-reset.rules).
+    Setzt ein USB-Gerät per Software zurück – wirkt wie Aus- und Einstecken.
+    1. Versuch: Port-Reset (startet die Geräte-Firmware neu).
+    2. Versuch: Gerät über <usb_dir>/authorized ab- und wieder anmelden
+       (siehe setup/91-straiver-usb-reset.rules).
 
     Returns: (erfolg: bool, meldung: str)
     """
@@ -255,6 +279,12 @@ def usb_reset(usb_dir, off_seconds=1.0):
         return False, "USB-Reset ist nur unter Linux möglich."
     if not usb_dir:
         return False, "USB-Gerät nicht gefunden."
+    try:
+        usb_port_reset(usb_dir)
+        return True, "USB-Port wurde zurückgesetzt."
+    except OSError as e:
+        print(f"[USB] Port-Reset nicht möglich ({e}) – versuche Ab-/Anmelden")
+
     auth = os.path.join(usb_dir, "authorized")
     try:
         with open(auth, "w") as f:
