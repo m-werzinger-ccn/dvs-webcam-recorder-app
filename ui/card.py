@@ -22,6 +22,7 @@ from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtGui import QFont
 
 from ui.dual_camera_view import DualCameraView
+from recorder import HAS_METAVISION
 import config
 
 
@@ -57,8 +58,8 @@ class RecordingCard(QFrame):
         # Kamera-Modi
         self.WEBCAM_ONLY = 0
         self.DUAL_CAMERA = 1
-        # ÄNDERUNG: Standard auf Dual-Kamera setzen
-        self.camera_mode = self.DUAL_CAMERA
+        # Standard: Webcam + DVS – außer das Metavision SDK fehlt (z. B. macOS)
+        self.camera_mode = self.DUAL_CAMERA if HAS_METAVISION else self.WEBCAM_ONLY
 
         # Aufnahmefenster (wird erst erstellt, wenn angeklickt)
         self.view = None
@@ -129,8 +130,7 @@ class RecordingCard(QFrame):
         self.mode_combo.addItem("Nur Webcam", self.WEBCAM_ONLY)
         self.mode_combo.addItem("Webcam + DVS", self.DUAL_CAMERA)
 
-        # ÄNDERUNG: Standard auf Dual-Kamera (Index 1) setzen
-        self.mode_combo.setCurrentIndex(1)
+        self.mode_combo.setCurrentIndex(1 if self.camera_mode == self.DUAL_CAMERA else 0)
 
         self.mode_combo.currentIndexChanged.connect(self.on_mode_changed)
         mode_layout.addWidget(self.mode_combo)
