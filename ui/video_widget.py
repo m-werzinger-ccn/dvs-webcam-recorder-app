@@ -7,7 +7,7 @@ Dieses Widget kann als Ersatz für QLabel verwendet werden.
 """
 
 from PyQt5.QtWidgets import QWidget, QSizePolicy
-from PyQt5.QtCore import Qt, QSize
+from PyQt5.QtCore import Qt, QSize, QRect
 from PyQt5.QtGui import QPainter, QImage, QPixmap
 
 
@@ -64,19 +64,17 @@ class VideoDisplayWidget(QWidget):
             painter.fillRect(self.rect(), Qt.black)
             return
 
-        # Bild skalieren, um in das Widget zu passen (Aspektverhältnis beibehalten)
-        scaled_pixmap = self.pixmap.scaled(
-            self.width(), self.height(), Qt.KeepAspectRatio, Qt.SmoothTransformation
-        )
+        # Zielrechteck mit gleichem Seitenverhältnis, zentriert. Direkt in das
+        # Rechteck zeichnen statt jedes Mal eine skalierte Kopie anzulegen.
+        pw, ph = self.pixmap.width(), self.pixmap.height()
+        scale = min(self.width() / pw, self.height() / ph)
+        w, h = int(pw * scale), int(ph * scale)
+        target = QRect((self.width() - w) // 2, (self.height() - h) // 2, w, h)
 
-        # Position berechnen, um das Bild zu zentrieren
-        x = (self.width() - scaled_pixmap.width()) / 2
-        y = (self.height() - scaled_pixmap.height()) / 2
-
-        # Bild zeichnen
         painter = QPainter(self)
-        painter.fillRect(self.rect(), Qt.black)  # Hintergrund schwarz machen
-        painter.drawPixmap(int(x), int(y), scaled_pixmap)
+        painter.fillRect(self.rect(), Qt.black)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform)
+        painter.drawPixmap(target, self.pixmap)
 
     def sizeHint(self):
         """Bevorzugte Größe des Widgets"""

@@ -66,6 +66,8 @@ class DVSRecorder(QThread):
         self._commands = queue.Queue()
         # Zeitpunkt des letzten echten Kamerabilds (für die Hänger-Erkennung)
         self.last_frame_time = 0.0
+        # Höchstens ein Vorschaubild gleichzeitig unterwegs zur Oberfläche
+        self._frame_in_flight = False
 
         self._event_count = 0
         self._rate_t0 = time.monotonic()
@@ -163,10 +165,18 @@ class DVSRecorder(QThread):
         if not self.running:
             return
         self.last_frame_time = time.monotonic()
-        rgb = cv2.cvtColor(cd_frame, cv2.COLOR_BGR2RGB)
-        self._emit_rgb(rgb)
+        if self._frame_in_flight:
+            return  # GUI ist noch beim letzten Bild -> dieses verwerfen
+        self._emit_rgb(cv2.cvtColor(cd_frame, cv2.COLOR_BGR2RGB))
+
+    def frame_consumed(self):
+        """Wird von der GUI aufgerufen, sobald ein Vorschaubild verarbeitet ist."""
+        self._frame_in_flight = False
 
     def _emit_rgb(self, rgb):
+        if self._frame_in_flight:
+            return
+        self._frame_in_flight = True
         rgb = np.ascontiguousarray(rgb)
         h, w = rgb.shape[:2]
         self.update_frame.emit(QImage(rgb.data, w, h, 3 * w, QImage.Format_RGB888).copy())

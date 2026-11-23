@@ -590,6 +590,23 @@ class VideoRecorder(QThread):
         self.processing_thread = None
         self.processing_worker = None
 
+        # Höchstens ein Vorschaubild gleichzeitig unterwegs zur Oberfläche.
+        # Kommt die GUI nicht hinterher, werden Vorschaubilder verworfen statt
+        # sich im Speicher zu stauen (die Aufnahme selbst ist davon unberührt).
+        self._frame_in_flight = False
+
+    def frame_consumed(self):
+        """Wird von der GUI aufgerufen, sobald ein Vorschaubild verarbeitet ist."""
+        self._frame_in_flight = False
+
+    def _emit_preview(self, rgb):
+        if self._frame_in_flight:
+            return
+        self._frame_in_flight = True
+        h, w = rgb.shape[:2]
+        # .copy(): das QImage darf nicht auf den numpy-Puffer zeigen
+        self.update_frame.emit(QImage(rgb.data, w, h, 3 * w, QImage.Format_RGB888).copy())
+
     # ----------------------------------------------------------------- Zoom
 
     def set_zoom(self, zoom_factor):
@@ -712,13 +729,8 @@ class VideoRecorder(QThread):
                         self.frame_count += 1
 
                 self._update_fps()
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                h, w, ch = rgb.shape
-                # .copy(): das QImage darf nicht auf den numpy-Puffer zeigen,
-                # der nach dem Senden an den GUI-Thread freigegeben wird.
-                self.update_frame.emit(
-                    QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888).copy()
-                )
+                if not self._frame_in_flight:
+                    self._emit_preview(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
         except Exception as e:
             self.error_signal.emit(f"Kritischer Webcam-Fehler: {e}")
             print(f"[Webcam] Kritischer Fehler: {e}")
@@ -762,7 +774,7 @@ class VideoRecorder(QThread):
         for i, line in enumerate(("Webcam nicht verbunden", "Verbinde automatisch neu...")):
             cv2.putText(frame, line, (40, 170 + 40 * i), cv2.FONT_HERSHEY_SIMPLEX,
                         0.8, (230, 230, 230), 2)
-        self.update_frame.emit(QImage(frame.data, 640, 360, 640 * 3, QImage.Format_RGB888).copy())
+        self._emit_preview(frame)
 
     # ------------------------------------------------------------ Aufnahme
 

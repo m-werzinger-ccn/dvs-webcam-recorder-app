@@ -10,6 +10,7 @@ Hauptursache dafür, dass Kameras "plötzlich weg" waren. Jetzt gibt es genau
 eine Sitzung pro Untersuchung; die Aufnahmefenster hängen sich nur an.
 """
 
+import os
 import time
 
 from PyQt5.QtCore import QObject, QTimer, pyqtSignal
@@ -136,6 +137,34 @@ class CameraSession(QObject):
         else:
             self._set_status("mic", "error", "Mikrofon nicht gefunden – neu einstecken")
 
+    @staticmethod
+    def _forward_frame(signal, recorder, image):
+        """Vorschaubild an die Fenster weitergeben und dem Recorder melden,
+        dass das nächste geschickt werden darf (läuft im GUI-Thread)."""
+        try:
+            signal.emit(image)
+        finally:
+            recorder.frame_consumed()
+
+    def _log_status(self):
+        """Alle 10 s eine Statuszeile ins Log (für die Fehlersuche)."""
+        parts = []
+        if self.webcam is not None:
+            age = time.monotonic() - self.webcam.last_frame_time
+            parts.append(f"Webcam {self.webcam.measured_fps:.0f} fps (letztes Bild vor {age:.1f} s)")
+        if self.dvs is not None:
+            age = time.monotonic() - self.dvs.last_frame_time
+            parts.append(f"DVS {self.dvs.event_rate_mev:.2f} Mev/s, Zustand {self.dvs.state} (letztes Bild vor {age:.1f} s)")
+        try:
+            with open("/proc/self/statm") as f:
+                rss_mb = int(f.read().split()[1]) * os.sysconf("SC_PAGE_SIZE") / 1e6
+            parts.append(f"RAM {rss_mb:.0f} MB")
+        except (OSError, ValueError):
+            pass
+        if self._zombies:
+            parts.append(f"{len(self._zombies)} hängende Threads")
+        print("[Status] " + " | ".join(parts), flush=True)
+
     def _on_watchdog(self):
         # DVS meldet "ok", liefert aber keine Bilder mehr -> hängt
         if self.dvs is not None and self.dvs.state == "ok":
@@ -144,6 +173,9 @@ class CameraSession(QObject):
                 self._set_status(
                     "dvs", "error", "Keine Daten von der DVS-Kamera – bitte „Neu verbinden“"
                 )
+        self._log_counter = getattr(self, "_log_counter", 0) + 1
+        if self._log_counter % 10 == 0:
+            self._log_status()
         self._storage_counter += 1
         if self._storage_counter >= STORAGE_CHECK_INTERVAL_S:
             self._storage_counter = 0
@@ -163,7 +195,7 @@ class CameraSession(QObject):
             zoom_factor=self.zoom_factor,
         )
         w = self.webcam
-        w.update_frame.connect(self.webcam_frame.emit)
+        w.update_frame.connect(lambda img, r=w: self._forward_frame(self.webcam_frame, r, img))
         w.status_changed.connect(lambda s, d: self._set_status("webcam", s, d))
         w.processing_status.connect(self.processing_status.emit)
         w.video_processing_completed.connect(self.video_processing_completed.emit)
@@ -207,7 +239,7 @@ class CameraSession(QObject):
     def _start_dvs(self):
         self.dvs = DVSRecorder()
         d = self.dvs
-        d.update_frame.connect(self.dvs_frame.emit)
+        d.update_frame.connect(lambda img, r=d: self._forward_frame(self.dvs_frame, r, img))
         d.status_changed.connect(self._on_dvs_status)
         d.recording_interrupted.connect(self.recording_interrupted.emit)
         d.error_signal.connect(self.error.emit)
