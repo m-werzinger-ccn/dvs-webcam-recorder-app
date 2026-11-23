@@ -1,98 +1,152 @@
-# STRAIVER – Untersuchungs-Recorder
+# DVS + Webcam Recorder (STRAIVER)
 
-Nimmt NIHSS-Untersuchungen gleichzeitig mit einer Webcam und einer Prophesee-DVS-Kamera
-(plus optional einem externen Mikrofon) auf. Nach jedem NIHSS-Punkt gibt der Arzt seine
-Bewertung und Notizen ab; alles wird pro Patient und Punkt in einem Ordner gespeichert.
+Aufnahme-App für das Forschungsprojekt **STRAIVER**: Patientinnen und Patienten werden während
+des **NIHSS-Tests** (Schlaganfall-Skala), den eine Ärztin oder ein Arzt durchführt, gleichzeitig
+mit einer **Webcam** und einer **eventbasierten Kamera (DVS, Prophesee)** aufgenommen – optional
+mit externem Mikrofon. Nach jedem NIHSS-Punkt wird die ärztliche Bewertung samt Notizen
+gespeichert. Aus diesen Daten entsteht später ein Modell, das den Test automatisch auswertet.
 
-## 1. Systemvoraussetzungen
+Die App ist für die Bedienung durch medizinisches Personal ohne Technik-Kenntnisse gebaut:
+Gerätestatus als Ampel, „Neu verbinden“ statt Kabel umstecken, Warnungen statt stiller Fehler.
 
-- **Aufnahme-Laptop:** Ubuntu 22.04 oder 24.04 (amd64), Python 3.10+
-- **DVS-Kamera:** Prophesee EVK (IMX636) an einem **USB-3-Port** (über den Hub prüfen!)
-- **Webcam:** USB-Webcam mit MJPG-Unterstützung (z. B. UGREEN)
-- **Metavision SDK / OpenEB** von Prophesee – gibt es nur für Linux und Windows, nicht für macOS
+## Screenshots
 
-## 2. Installation (Linux-Laptop)
+| Untersuchung anlegen | Hauptfenster mit Gerätestatus |
+|---|---|
+| ![Patientendialog](docs/screenshots/patient_dialog.png) | ![Hauptfenster](docs/screenshots/main_window.png) |
 
-```bash
-# Systempakete
-sudo apt install python3-venv python3-pyqt5 portaudio19-dev ffmpeg v4l-utils
-# Metavision SDK nach Anleitung: https://docs.prophesee.ai/stable/installation/index.html
+**Aufnahme eines NIHSS-Punkts** – links Webcam, rechts DVS, hier mit gewähltem Bereich (Arm):
 
-# App
-git clone <repo-url> straiver-recorder && cd straiver-recorder
-python3 -m venv --system-site-packages .venv     # damit Metavision gefunden wird
-.venv/bin/pip install -r requirements.txt
+![Aufnahmefenster mit Bereich](docs/screenshots/recording_region.png)
 
-# Einmalig: USB-Stabilität (Autosuspend aus, Software-Reset erlauben, Gruppenrechte)
-bash setup/install_usb_rules.sh                    # danach ab- und wieder anmelden
-```
+**Kameras ausrichten** – die DVS-Events (türkis) liegen über dem Webcam-Bild, der gelbe Rahmen
+ist das Bildfeld der DVS:
 
-Start: `bash setup/run.sh` – oder einmalig `bash setup/install_desktop_shortcut.sh` ausführen, dann gibt es ein Icon „STRAIVER Recorder“ auf dem Schreibtisch und im App-Menü. Jede Sitzung wird in `logs/` mitprotokolliert.
+![Kameras ausrichten](docs/screenshots/alignment.png)
 
-## 3. Bedienung – Gerätestatus („Ampel“)
+<sub>Die Kamerabilder in den Screenshots sind synthetisch erzeugt (keine echten Personen).</sub>
 
-Im Hauptfenster und in jedem Aufnahmefenster zeigt eine Ampel den Zustand von
-Webcam, DVS-Kamera, externem Mikrofon und Speicher:
+## Funktionen
 
-- **grün** – bereit
-- **orange** – verbindet gerade / Hinweis (z. B. DVS nur mit USB 2.0, USB-Stick mit FAT32)
-- **rot** – Problem. Auf **„Neu verbinden“** klicken: Die App trennt die Kamera per Software
-  und verbindet sie neu (wirkt wie Aus- und Einstecken). Kabel umstecken ist nur noch nötig,
-  wenn das nicht hilft.
+- Gleichzeitige Aufnahme **Webcam (MP4) + DVS (RAW)** + optional externes Mikrofon (WAV)
+- Alle 15 NIHSS-Punkte als Karten; nach jeder Aufnahme **Bewertung + Notizen** (JSON)
+- **Gerätestatus-Ampel** für Webcam, DVS, Mikrofon und Speicher, mit **„Neu verbinden“**
+  (Software-USB-Reset – wirkt wie Kabel aus-/einstecken)
+- Kameras bleiben die ganze Untersuchung verbunden, **automatische Wiederverbindung**,
+  Warnung, falls eine Kamera fehlt oder während der Aufnahme ausfällt
+- **Kameras ausrichten** (pro Objektiv-Profil): Webcam- und DVS-Bildfeld zur Deckung bringen,
+  von Hand oder automatisch
+- **Bereich wählen** (optional pro NIHSS-Punkt): beide Kameras nehmen nur diesen Bereich auf
+  (Webcam-Zuschnitt, DVS-Hardware-ROI)
+- Pro Aufnahme eine **Metadaten-Datei** (Zeitstempel, Ausrichtung, Bereich, Auflösung, fps)
+- **PDF-Bericht** mit allen Bewertungen einer Untersuchung
+- Speicherprüfung (freier Platz, FAT32-Warnung), Log jeder Sitzung
 
-Die Kameras bleiben während der ganzen Untersuchung verbunden; Aufnahmefenster öffnen und
-schließen sie nicht mehr. Fällt eine Kamera aus, verbindet die App automatisch neu.
-Ist beim Start einer Aufnahme eine Kamera nicht bereit, fragt die App nach, statt
-stillschweigend nur mit einer Kamera aufzunehmen. Bricht eine Kamera während der
-Aufnahme ab, erscheint ein roter Warnhinweis.
+## Voraussetzungen
 
-## 4. Kameras ausrichten und Bereich wählen
+| | |
+|---|---|
+| Rechner | Linux, **Ubuntu 22.04 / 24.04** (amd64). 26.04 und arm64 funktionieren ebenfalls (OpenEB wird dann aus dem Quellcode gebaut). |
+| DVS | Prophesee EVK3 HD / EVK4 (IMX636) an einem **USB-3-Port** |
+| Webcam | USB-Webcam mit MJPG (z. B. UGREEN, Logitech C920) |
+| Speicher | USB-Stick/SSD, am besten **exFAT** (FAT32 erlaubt nur 4 GB pro Datei) |
 
-Zwei Stufen:
+Webcam, DVS und ggf. Mikrofon können über einen **aktiven USB-Hub** (mit eigenem Netzteil)
+angeschlossen werden. Die DVS braucht USB 3 – die App warnt, wenn sie nur mit USB 2 läuft.
 
-1. **Ausrichtung – gilt für alle Untersuchungen** (einmal pro Aufbau bzw. Objektiv;
-   „Kameras ausrichten…“ in der Werkzeugleiste oder im Aufnahmefenster).
-   Die DVS-Events werden türkis über das Webcam-Bild gelegt, der gelbe Rahmen zeigt das
-   Bildfeld der DVS. Rahmen mit der Maus verschieben, Größe mit dem **Regler „Größe des
-   DVS-Bildfelds“** oder dem Mausrad einstellen (Pfeiltasten zur Feinjustierung), bis die
-   Events auf den passenden Stellen liegen – oder „Automatisch ausrichten“ und die Hand vor
-   beiden Kameras bewegen.
-   - unter 100 %: die DVS sieht einen Ausschnitt der Webcam → die Webcam wird zugeschnitten
-   - über 100 %: die DVS sieht mehr als die Webcam (Rahmen ragt in den grauen Rand) → die
-     DVS wird per Hardware-ROI auf das gemeinsame Bildfeld beschnitten
-
-   Pro Objektiv ein eigenes **Objektiv-Profil** anlegen. Die Ausrichtung stimmt exakt für die
-   Entfernung, in der ausgerichtet wurde (Webcam und DVS sitzen übereinander) – also an der
-   Untersuchungsposition ausrichten.
-
-2. **Bereich – optional pro NIHSS-Punkt** (im Aufnahmefenster): Standard ist das ganze
-   gemeinsame Bild. „Bereich wählen“ und in einem der beiden Bilder ein Rechteck aufziehen,
-   dann nehmen beide Kameras nur diesen Bereich auf (Webcam zugeschnitten, DVS per
-   Hardware-ROI – Ereignisse außerhalb werden nicht aufgezeichnet). Der Bereich wird pro
-   NIHSS-Punkt gemerkt, „Ganzes Bild“ hebt ihn auf.
-
-Gespeichert wird beides in `~/.config/straiver-recorder/alignment.json`. Zu jeder Aufnahme
-schreibt die App eine `<name>_meta.json` mit Start/Stopp-Zeit, Ausrichtung, gemeinsamem
-Bildfeld, Bereich, Webcam-Zuschnitt in Pixeln, Auflösung, tatsächlicher fps und DVS-ROI.
-
-## 5. Fehlerbehebung
-
-Wenn eine Kamera fehlt – **bevor** etwas umgesteckt wird:
+## Installation
 
 ```bash
-bash tools/diagnose_hardware.sh > ~/diagnose_$(date +%Y%m%d_%H%M).txt 2>&1
+# 1. Repository holen
+git clone https://github.com/m-werzinger-ccn/dvs-webcam-recorder-app.git
+cd dvs-webcam-recorder-app
+
+# 2. Alles einrichten: Systempakete, Metavision/OpenEB, Python-Umgebung, USB-Regeln
+bash setup/setup_linux_dev.sh
+
+# 3. Icon auf dem Schreibtisch und im App-Menü anlegen
+bash setup/install_desktop_shortcut.sh
 ```
 
-Die Datei enthält USB-Baum und -Geschwindigkeit, Autosuspend-Status, Videogeräte,
-Metavision-Status, Dateisystem des USB-Sticks und das Kernel-Log.
+Danach **einmal ab- und wieder anmelden** (damit die Gruppenrechte für Kamera und USB greifen).
 
-Häufige Ursachen:
-- DVS hängt am Hub nur mit USB 2.0 (`lsusb -t` zeigt 480M statt 5000M) → anderer Port/Kabel
-- USB-Stick mit FAT32 → Dateien max. 4 GB; besser exFAT
-- Benutzer nicht in den Gruppen `video`/`plugdev` → `setup/install_usb_rules.sh`
+- Ist das **Metavision SDK schon installiert** (z. B. per apt von Prophesee), erkennt das das
+  Skript und baut OpenEB nicht noch einmal – dann dauert die Einrichtung nur wenige Minuten.
+  Sonst wird OpenEB aus dem Quellcode gebaut (ca. 20–40 Minuten).
+- Zeigt das Icon auf dem Schreibtisch ein Warnsymbol: Rechtsklick → **„Start erlauben“**.
+- Prüfen, ob die DVS erkannt wird: `metavision_platform_info`
 
-## 6. Entwicklung auf dem Mac
+**Aktualisieren:** `git pull` im App-Ordner – fertig (das Setup nur erneut ausführen, wenn sich
+in `setup/` etwas geändert hat).
 
-Die Geräteerkennung ist plattformabhängig (Linux: V4L2, macOS: AVFoundation). Auf dem Mac
-läuft die App mit Webcam, aber ohne DVS (Metavision gibt es dort nicht; die DVS-Ampel steht
-dann auf grau). Für Aufnahmen auf dem Mac den Modus „Nur Webcam“ wählen.
+**Starten:** über das Icon **„STRAIVER Recorder“** oder im Terminal mit `bash setup/run.sh`.
+
+## Benutzung
+
+1. **Kameras einstecken**, App über das Icon starten.
+2. **Untersuchung anlegen:** Patienten-ID (bitte ein **Pseudonym**, keinen Klarnamen), Name der
+   untersuchenden Person, Zeitpunkt und **Speicherort** (z. B. USB-Stick) wählen. Optional
+   externes Mikrofon auswählen.
+3. **Gerätestatus prüfen:** alles grün = bereit.
+   Rot? Auf **„Neu verbinden“** klicken. Hilft das nicht, Kabel prüfen.
+4. **Einmalig: Kameras ausrichten** (Werkzeugleiste → „Kameras ausrichten…“) – nur nötig beim
+   ersten Aufbau oder nach einem Objektivwechsel. Rahmen verschieben und mit dem Regler
+   **„Größe des DVS-Bildfelds“** skalieren, bis die türkisen DVS-Punkte auf den passenden
+   Stellen im Webcam-Bild liegen – oder **„Automatisch ausrichten“** und die Hand vor beiden
+   Kameras bewegen. Für jedes Objektiv ein eigenes **Objektiv-Profil** anlegen. Am besten an
+   der Untersuchungsposition ausrichten (die Kameras sitzen übereinander, die Ausrichtung
+   stimmt exakt für diese Entfernung).
+5. **Pro NIHSS-Punkt:** auf der Karte **„Aufnahme starten“** klicken. Im Aufnahmefenster
+   - optional **„Bereich wählen“** und ein Rechteck aufziehen (z. B. um Gesicht oder Arm) –
+     wird für diesen Punkt gemerkt; **„Ganzes Bild“** hebt ihn auf,
+   - **„Aufnahme starten“** / **„Aufnahme stoppen“**,
+   - danach **Bewertung und Notizen** eintragen. Die Karte wird grün.
+6. Am Ende **„Bericht erstellen“** (PDF mit allen Bewertungen).
+
+Fehlt beim Start einer Aufnahme eine Kamera, fragt die App nach, statt nur mit einer Kamera
+aufzunehmen. Fällt eine Kamera während der Aufnahme aus, erscheint ein roter Hinweis.
+
+### Was wird gespeichert?
+
+```
+<Speicherort>/<Patienten-ID>/<NIHSS-Punkt>/
+├── <Name>.mp4            Webcam-Video (auf Ausrichtung/Bereich zugeschnitten)
+├── <Name>.raw            DVS-Events (Prophesee RAW, ggf. nur der gewählte Bereich)
+├── <Name>_audio.wav      externes Mikrofon (falls aktiviert)
+├── <Name>_rating.json    Bewertung + Notizen
+└── <Name>_meta.json      Zeitstempel, Ausrichtung, Bereich, Zuschnitt, Auflösung, fps, DVS-ROI
+```
+
+Ausrichtung und gemerkte Bereiche liegen in `~/.config/straiver-recorder/alignment.json`,
+Einstellungen wie die Webcam-Auflösung in `config.py`.
+
+## Fehlerbehebung
+
+| Problem | Lösung |
+|---|---|
+| Kamera rot / „nicht gefunden“ | „Neu verbinden“ klicken; sonst USB-Kabel und Hub (Netzteil!) prüfen |
+| DVS orange „nur USB 2.0“ | anderen USB-3-Port oder anderes Kabel verwenden |
+| Speicher orange „FAT32“ | Stick als exFAT formatieren |
+| „Neu verbinden“ meldet fehlende Berechtigung | `bash setup/install_usb_rules.sh`, ab- und wieder anmelden |
+| Etwas anderes | `bash tools/diagnose_hardware.sh > diagnose.txt 2>&1` **vor** dem Umstecken ausführen |
+
+Jede Sitzung wird in `logs/app_<Datum>.log` mitgeschrieben (alle 10 s eine Statuszeile mit
+fps, DVS-Eventrate und Speicherverbrauch). Mit `tools/dvs_stream_test.py` lässt sich die DVS
+ohne Oberfläche testen.
+
+## Entwicklung
+
+- **macOS:** läuft mit Webcam, aber ohne DVS (Metavision gibt es nicht für macOS) – die
+  DVS-Ampel ist dann grau, Modus „Nur Webcam“.
+- **Kompletter Test auf dem Mac:** Ubuntu-VM (z. B. Parallels, ARM) mit durchgereichten
+  USB-Geräten; `setup/setup_linux_dev.sh` baut OpenEB dort aus dem Quellcode.
+
+```
+main.py                  Einstiegspunkt
+config.py                NIHSS-Kategorien, Auflösung, fps
+recorder/                Kamera-Sitzung, Webcam-, DVS- und Audio-Recorder
+ui/                      Fenster und Dialoge (PyQt5)
+utils/                   Geräteerkennung, USB-Reset, Ausrichtung, Speicherprüfung, PDF
+setup/                   Installation, udev-Regeln, Startskript, Desktop-Icon
+tools/                   Hardware-Diagnose, DVS-Streamtest
+```

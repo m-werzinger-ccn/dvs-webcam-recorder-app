@@ -8,6 +8,7 @@
 #
 # Aufruf (aus dem App-Ordner):  bash setup/setup_linux_dev.sh
 # Dauer: ca. 30–60 min (der OpenEB-Build dauert am längsten).
+# Ist das Metavision SDK schon installiert, wird OpenEB nicht gebaut (dann wenige Minuten).
 # Danach starten mit:            bash setup/run.sh
 set -euo pipefail
 
@@ -42,8 +43,19 @@ done
 [ ${#MISSING[@]} -gt 0 ] && echo "Nicht verfügbar (übersprungen): ${MISSING[*]}"
 sudo apt-get -y install "${AVAILABLE[@]}"
 
+# Ist das Metavision SDK schon installiert (z. B. per apt von Prophesee)?
+# Dann OpenEB NICHT zusätzlich bauen – zwei Installationen beißen sich.
+HAVE_MV=0
+if [ -z "${FORCE_OPENEB_BUILD:-}" ] && python3 -c "import metavision_core, metavision_hal" 2>/dev/null; then
+  HAVE_MV=1
+  echo "Metavision SDK ist bereits installiert – OpenEB wird nicht gebaut."
+  echo "(Neu bauen erzwingen mit: FORCE_OPENEB_BUILD=1 bash setup/setup_linux_dev.sh)"
+fi
+
 step "2/5 OpenEB-Quellcode"
-if [ ! -d "$SRC_DIR/.git" ]; then
+if [ "$HAVE_MV" = 1 ]; then
+  echo "übersprungen"
+elif [ ! -d "$SRC_DIR/.git" ]; then
   # neueste Release-Version von OpenEB ermitteln (überschreibbar mit OPENEB_VERSION=x.y.z)
   VERSION="${OPENEB_VERSION:-$(git ls-remote --tags --refs https://github.com/prophesee-ai/openeb.git \
     | sed 's#.*/##' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)}"
@@ -64,16 +76,20 @@ step "3/5 Python-Umgebung $VENV"
 "$VENV/bin/pip" install reportlab
 
 step "4/5 OpenEB bauen und installieren (dauert)"
-mkdir -p "$SRC_DIR/build"
-cd "$SRC_DIR/build"
-# "-include cstdint": OpenEB 5.x vergisst in einigen Headern <cstdint>;
-# ab GCC 15 (Ubuntu 26.04) ist das ein Fehler.
-cmake .. -Wno-dev -DBUILD_TESTING=OFF -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_CXX_FLAGS="-include cstdint" \
-  -DPython3_EXECUTABLE="$(command -v python3)"
-cmake --build . --config Release -- -j"$JOBS"
-sudo cmake --build . --target install
-sudo ldconfig
+if [ "$HAVE_MV" = 1 ]; then
+  echo "übersprungen"
+else
+  mkdir -p "$SRC_DIR/build"
+  cd "$SRC_DIR/build"
+  # "-include cstdint": OpenEB 5.x vergisst in einigen Headern <cstdint>;
+  # ab GCC 15 (Ubuntu 26.04) ist das ein Fehler.
+  cmake .. -Wno-dev -DBUILD_TESTING=OFF -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_CXX_FLAGS="-include cstdint" \
+    -DPython3_EXECUTABLE="$(command -v python3)"
+  cmake --build . --config Release -- -j"$JOBS"
+  sudo cmake --build . --target install
+  sudo ldconfig
+fi
 
 # Python-Module von OpenEB der venv bekannt machen
 SITE="$("$VENV/bin/python" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
