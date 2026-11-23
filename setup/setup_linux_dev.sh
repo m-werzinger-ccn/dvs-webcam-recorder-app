@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Richtet ein Ubuntu-System (22.04/24.04, amd64 ODER arm64 – z. B. Parallels-VM
+# Richtet ein Ubuntu-System (22.04/24.04/26.04, amd64 ODER arm64 – z. B. Parallels-VM
 # auf dem Mac) komplett für die Aufnahme-App ein:
 #   1. Systempakete
 #   2. OpenEB (offener Teil des Metavision SDK) aus dem Quellcode bauen
@@ -19,14 +19,26 @@ JOBS="$(nproc)"
 step() { echo; echo "=== $* ==="; }
 
 step "1/5 Systempakete"
-sudo apt-get update
-sudo apt-get -y install \
-  build-essential cmake git wget unzip curl pkg-config \
-  libopencv-dev libboost-all-dev libusb-1.0-0-dev libprotobuf-dev protobuf-compiler \
-  libhdf5-dev hdf5-tools libglew-dev libglfw3-dev libcanberra-gtk-module \
-  python3-dev python3-venv python3-pip pybind11-dev \
-  python3-pyqt5 python3-pyaudio python3-numpy python3-opencv \
+PKGS=(
+  build-essential cmake git wget unzip curl pkg-config
+  libopencv-dev libboost-all-dev libusb-1.0-0-dev libprotobuf-dev protobuf-compiler
+  libhdf5-dev hdf5-tools libglew-dev libglfw3-dev libcanberra-gtk-module libcanberra-gtk3-module
+  python3-dev python3-venv python3-pip pybind11-dev
+  python3-pyqt5 python3-pyaudio python3-numpy python3-opencv
   portaudio19-dev ffmpeg v4l-utils usbutils
+)
+sudo apt-get update
+# Je nach Ubuntu-Version fehlen einzelne Pakete -> nur installieren, was es gibt
+AVAILABLE=(); MISSING=()
+for p in "${PKGS[@]}"; do
+  if apt-cache policy "$p" 2>/dev/null | grep -q 'Candidate: [^(]'; then
+    AVAILABLE+=("$p")
+  else
+    MISSING+=("$p")
+  fi
+done
+[ ${#MISSING[@]} -gt 0 ] && echo "Nicht verfügbar (übersprungen): ${MISSING[*]}"
+sudo apt-get -y install "${AVAILABLE[@]}"
 
 step "2/5 OpenEB-Quellcode"
 if [ ! -d "$SRC_DIR/.git" ]; then
@@ -46,7 +58,8 @@ step "3/5 Python-Umgebung $VENV"
 "$VENV/bin/pip" install --upgrade pip
 REQ="$(find "$SRC_DIR/utils/python" -name 'requirements_openeb*.txt' | head -1 || true)"
 if [ -n "$REQ" ]; then
-  "$VENV/bin/pip" install -r "$REQ"
+  # Diese Pakete braucht OpenEB nur für Beispiele/Tools – Fehler hier nicht fatal
+  "$VENV/bin/pip" install -r "$REQ" || echo "WARNUNG: Nicht alle OpenEB-Python-Extras installiert (für die App unkritisch)"
 fi
 "$VENV/bin/pip" install reportlab
 
