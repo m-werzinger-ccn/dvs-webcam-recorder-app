@@ -17,7 +17,7 @@ class VideoDisplayWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.pixmap = None
-        self.setMinimumSize(640, 480)
+        self.setMinimumSize(320, 180)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setAttribute(Qt.WA_OpaquePaintEvent)  # Für bessere Performance
 
@@ -78,7 +78,7 @@ class VideoDisplayWidget(QWidget):
 
     def sizeHint(self):
         """Bevorzugte Größe des Widgets"""
-        return QSize(1280, 720)
+        return QSize(640, 360)
 
     def minimumSizeHint(self):
         """Minimale Größe des Widgets"""

@@ -31,6 +31,7 @@ from ui.patient_dialog import PatientDialog
 from utils.devices import list_cameras
 from recorder.camera_session import CameraSession
 from ui.status_panel import DeviceStatusPanel
+from ui.window_utils import fit_to_screen
 from config import WINDOW_WIDTH, WINDOW_HEIGHT, EXAMINATION_CATEGORIES
 
 # Der Import von pdf_generator erfolgt dynamisch in der generate_report Methode
@@ -160,7 +161,8 @@ class MainWindow(QMainWindow):
             parent=self,
         )
         self.session.start()
-        self.setMinimumSize(WINDOW_WIDTH, WINDOW_HEIGHT)
+        self.setMinimumSize(800, 550)
+        fit_to_screen(self)
 
         # Hauptwidget und Layout
         main_widget = QWidget()

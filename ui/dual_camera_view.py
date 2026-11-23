@@ -37,6 +37,7 @@ from recorder.camera_session import DEVICE_LABELS
 from ui.rating_dialog import RatingDialog
 from ui.status_panel import DeviceStatusPanel
 from ui.video_widget import VideoDisplayWidget
+from ui.window_utils import fit_to_screen
 
 
 class DualCameraView(QDialog):
@@ -71,6 +72,7 @@ class DualCameraView(QDialog):
             self.category = {"title": f"Aufnahme {self.card_id + 1}", "description": ""}
 
         self.init_ui()
+        fit_to_screen(self)
         self._connect_session()
 
         self._clock = QTimer(self)
@@ -82,7 +84,7 @@ class DualCameraView(QDialog):
     def init_ui(self):
         mode = "Webcam + DVS" if self.use_dvs else "Nur Webcam"
         self.setWindowTitle(f"{self.category['title']} – {mode}")
-        self.setMinimumSize(1600 if self.use_dvs else 1000, 720)
+        self.setMinimumSize(800, 500)
 
         main_layout = QVBoxLayout()
 
@@ -121,7 +123,7 @@ class DualCameraView(QDialog):
         webcam_layout.addWidget(self._section_title("Webcam (mit Digital-Zoom)"))
         self.webcam_label = VideoDisplayWidget()
         self.webcam_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.webcam_label.setMinimumSize(640, 360)
+        self.webcam_label.setMinimumSize(320, 180)
         self.webcam_label.setText("Webcam wird verbunden…")
         webcam_layout.addWidget(self.webcam_label)
         webcam_layout.addWidget(self._build_zoom_group())
@@ -135,7 +137,7 @@ class DualCameraView(QDialog):
             dvs_layout.addWidget(self._section_title("DVS-Kamera (Prophesee)"))
             self.dvs_label = VideoDisplayWidget()
             self.dvs_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-            self.dvs_label.setMinimumSize(640, 360)
+            self.dvs_label.setMinimumSize(320, 180)
             self.dvs_label.setText("DVS-Kamera wird verbunden…")
             dvs_layout.addWidget(self.dvs_label)
             self.splitter.addWidget(dvs_container)
