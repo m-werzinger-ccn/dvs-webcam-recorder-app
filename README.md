@@ -46,7 +46,28 @@ Ist beim Start einer Aufnahme eine Kamera nicht bereit, fragt die App nach, stat
 stillschweigend nur mit einer Kamera aufzunehmen. Bricht eine Kamera während der
 Aufnahme ab, erscheint ein roter Warnhinweis.
 
-## 4. Fehlerbehebung
+## 4. Kameras ausrichten und Bereich wählen
+
+**Kameras ausrichten** (einmal pro Aufbau bzw. Objektiv; Menüleiste oder Aufnahmefenster →
+„Kameras ausrichten…“): Die DVS-Events werden türkis über das Webcam-Bild gelegt. Den gelben
+Rahmen mit der Maus verschieben und mit dem Mausrad skalieren, bis die Events auf den passenden
+Stellen im Webcam-Bild liegen – oder „Automatisch ausrichten“ und die Hand vor beiden Kameras
+bewegen. Pro Objektiv ein eigenes **Objektiv-Profil** anlegen. Die Ausrichtung stimmt exakt für
+die Entfernung, in der ausgerichtet wurde (Webcam und DVS sitzen übereinander) – also am besten
+an der Untersuchungsposition ausrichten.
+
+**Bereich wählen** (im Aufnahmefenster): „Bereich wählen“ klicken und in einem der beiden Bilder
+ein Rechteck aufziehen. Dann nehmen **beide Kameras nur diesen Bereich auf**:
+- Webcam: Video wird auf den Bereich zugeschnitten
+- DVS: Hardware-ROI am Sensor – Ereignisse außerhalb werden gar nicht erst aufgezeichnet
+
+Der Bereich wird pro NIHSS-Punkt (und Objektiv-Profil) gemerkt. „Ganzes Bild“ hebt ihn auf.
+Gespeichert wird alles in `~/.config/straiver-recorder/alignment.json`.
+
+Zu jeder Aufnahme schreibt die App eine `<name>_meta.json` mit Start/Stopp-Zeit, Ausrichtung,
+Bereich, Webcam-Zuschnitt in Pixeln, Auflösung, tatsächlicher fps und DVS-ROI.
+
+## 5. Fehlerbehebung
 
 Wenn eine Kamera fehlt – **bevor** etwas umgesteckt wird:
 
@@ -62,7 +83,7 @@ Häufige Ursachen:
 - USB-Stick mit FAT32 → Dateien max. 4 GB; besser exFAT
 - Benutzer nicht in den Gruppen `video`/`plugdev` → `setup/install_usb_rules.sh`
 
-## 5. Entwicklung auf dem Mac
+## 6. Entwicklung auf dem Mac
 
 Die Geräteerkennung ist plattformabhängig (Linux: V4L2, macOS: AVFoundation). Auf dem Mac
 läuft die App mit Webcam, aber ohne DVS (Metavision gibt es dort nicht; die DVS-Ampel steht

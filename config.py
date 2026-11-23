@@ -17,6 +17,10 @@ DEFAULT_VIDEO_EXTENSION = ".mp4"  # Standard-Erweiterung
 
 # Aufnahme-Einstellungen
 DEFAULT_FPS = 30.0  # Höhere Framerate für medizinische Aufnahmen
+# Gewünschte Webcam-Auflösung. Weil das Bild auf das DVS-Bildfeld bzw. den gewählten
+# Bereich zugeschnitten wird, lohnt sich eine hohe Auflösung. Kann die Kamera das
+# nicht, nimmt sie die nächstkleinere (steht im Log und in der _meta.json).
+WEBCAM_RESOLUTION = (1920, 1080)
 
 # UI-Konfiguration
 WINDOW_WIDTH = 1280

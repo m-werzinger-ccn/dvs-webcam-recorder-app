@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Webcam-Recorder mit digitalem Zoom, Audio und automatischer Wiederverbindung.
+Webcam-Recorder mit Bildzuschnitt (Ausrichtung/Bereich), Audio und automatischer Wiederverbindung.
 
 Stabilität:
 - MJPG wird angefordert (unkomprimiertes 720p30 passt nicht durch USB 2.0
@@ -25,6 +25,7 @@ from PyQt5.QtCore import Qt, QThread, pyqtSignal, QObject
 from PyQt5.QtGui import QImage
 import config
 from utils.devices import opencv_backend
+from utils import alignment as al
 
 # PyAudio optional importieren
 try:
@@ -541,11 +542,10 @@ class VideoRecorder(QThread):
     status_changed = pyqtSignal(str, str)  # state, detail
     processing_status = pyqtSignal(str)
     video_processing_completed = pyqtSignal()
-    zoom_changed = pyqtSignal(float)
     recording_interrupted = pyqtSignal(str)
 
     def __init__(self, source=0, save_dir="", file_name="", audio_enabled=True,
-                 zoom_factor=1.5, camera_name=""):
+                 crop_rect=None, camera_name=""):
         super().__init__()
         self.source = source
         self.camera_name = camera_name or str(source)
@@ -581,9 +581,11 @@ class VideoRecorder(QThread):
         self.target_fps = config.DEFAULT_FPS
         self.actual_fps = None
 
-        # Zoom
-        self.zoom_factor = max(1.0, min(3.0, zoom_factor))
-        self.zoom_enabled = True
+        # Zuschnitt (normiertes Rechteck im Webcam-Bild, siehe utils/alignment.py)
+        self.crop_rect = al.clamp_rect(crop_rect) if crop_rect else al.FULL
+        # letztes unbeschnittenes Bild (für die Ausrichtungs-Ansicht)
+        self.latest_full_frame = None
+        self.full_size = (0, 0)
 
         self.mutex = threading.Lock()
 
@@ -607,25 +609,22 @@ class VideoRecorder(QThread):
         # .copy(): das QImage darf nicht auf den numpy-Puffer zeigen
         self.update_frame.emit(QImage(rgb.data, w, h, 3 * w, QImage.Format_RGB888).copy())
 
-    # ----------------------------------------------------------------- Zoom
+    # ------------------------------------------------------------ Zuschnitt
 
-    def set_zoom(self, zoom_factor):
+    def set_crop(self, rect):
+        """Bildausschnitt setzen (nicht während einer Aufnahme)."""
+        if self.recording:
+            return False
         with self.mutex:
-            self.zoom_factor = max(1.0, min(3.0, zoom_factor))
-        self.zoom_changed.emit(self.zoom_factor)
+            self.crop_rect = al.clamp_rect(rect) if rect else al.FULL
+        return True
 
-    def set_zoom_enabled(self, enabled):
-        with self.mutex:
-            self.zoom_enabled = enabled
-
-    def apply_zoom(self, frame):
-        if not self.zoom_enabled or self.zoom_factor <= 1.0:
-            return frame
-        h, w = frame.shape[:2]
-        new_w, new_h = int(w / self.zoom_factor), int(h / self.zoom_factor)
-        x, y = (w - new_w) // 2, (h - new_h) // 2
-        cropped = frame[y : y + new_h, x : x + new_w]
-        return cv2.resize(cropped, (w, h), interpolation=cv2.INTER_LINEAR)
+    def crop_info(self):
+        """Zuschnitt in Pixeln bezogen auf das volle Webcam-Bild (für Metadaten)."""
+        w, h = self.full_size
+        if not w:
+            return None
+        return al.to_pixels(self.crop_rect, w, h, even=True)
 
     # --------------------------------------------------------------- Status
 
@@ -667,8 +666,8 @@ class VideoRecorder(QThread):
         # MJPG zuerst setzen, dann Auflösung – sonst wählt der Treiber
         # unkomprimiertes YUYV mit zu hoher USB-Bandbreite.
         cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, config.WEBCAM_RESOLUTION[0])
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config.WEBCAM_RESOLUTION[1])
         cap.set(cv2.CAP_PROP_FPS, self.target_fps)
         if hasattr(cv2, "CAP_PROP_READ_TIMEOUT_MSEC"):
             # Ohne Timeout blockiert read() bei abgezogener Kamera bis zu 10 s
@@ -720,7 +719,9 @@ class VideoRecorder(QThread):
                     continue
 
                 self.last_frame_time = time.monotonic()
-                frame = self.apply_zoom(frame)
+                self.latest_full_frame = frame
+                self.full_size = (frame.shape[1], frame.shape[0])
+                frame = al.crop(frame, self.crop_rect)
                 self.frame_size = (frame.shape[1], frame.shape[0])
 
                 with self.mutex:
@@ -825,7 +826,7 @@ class VideoRecorder(QThread):
                     self.audio_recorder.start()
 
                 self.recording = True
-            print(f"[Webcam] Aufnahme gestartet ({self.frame_size[0]}x{self.frame_size[1]}, Zoom {self.zoom_factor:.2f}x)")
+            print(f"[Webcam] Aufnahme gestartet ({self.frame_size[0]}x{self.frame_size[1]}, Zuschnitt {self.crop_info()})")
             return True, ""
         except Exception as e:
             with self.mutex:

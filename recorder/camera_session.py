@@ -10,6 +10,8 @@ Hauptursache dafür, dass Kameras "plötzlich weg" waren. Jetzt gibt es genau
 eine Sitzung pro Untersuchung; die Aufnahmefenster hängen sich nur an.
 """
 
+import datetime
+import json
 import os
 import time
 
@@ -20,6 +22,8 @@ from recorder.dvs_recorder import DVSRecorder
 from recorder.video_recorder import VideoRecorder
 from utils.devices import find_prophesee_usb_devices, usb_reset, usb_speed_mbit
 from utils.storage import check_storage
+from utils import alignment as al
+import config
 
 DVS_STALL_TIMEOUT_S = 4.0
 STORAGE_CHECK_INTERVAL_S = 15
@@ -41,13 +45,19 @@ class CameraSession(QObject):
     recording_interrupted = pyqtSignal(str)
     error = pyqtSignal(str)
 
-    def __init__(self, camera=None, save_dir="", audio_enabled=True, zoom_factor=1.5,
-                 external_mic_enabled=False, external_mic_id=None, parent=None):
+    def __init__(self, camera=None, save_dir="", audio_enabled=True,
+                 external_mic_enabled=False, external_mic_id=None, alignment_store=None,
+                 parent=None):
         super().__init__(parent)
         self.camera = camera
         self.save_dir = save_dir
         self.audio_enabled = audio_enabled
-        self.zoom_factor = zoom_factor
+        # Ausrichtung (pro Objektiv-Profil) und aktueller Bereich, siehe utils/alignment.py
+        self.alignment_store = alignment_store or al.AlignmentStore()
+        self.alignment = self.alignment_store.alignment()
+        self.roi = None
+        self._roi_before_alignment = None
+        self._meta = None
         self.external_mic_enabled = external_mic_enabled
         self.external_mic_id = external_mic_id
 
@@ -165,6 +175,43 @@ class CameraSession(QObject):
             parts.append(f"{len(self._zombies)} hängende Threads")
         print("[Status] " + " | ".join(parts), flush=True)
 
+    def _write_metadata(self, webcam_recorded, stop_results):
+        """Schreibt <datei>_meta.json: Zeitstempel, Ausrichtung, Bereich, Zuschnitt."""
+        meta, self._meta = self._meta, None
+        if not meta:
+            return
+        w, d = self.webcam, self.dvs
+        meta["stop"] = datetime.datetime.now().astimezone().isoformat(timespec="milliseconds")
+        meta["app_version"] = config.APP_VERSION
+        meta["lens_profile"] = self.profile
+        meta["alignment_webcam_rect_norm"] = [round(v, 5) for v in self.alignment]
+        meta["roi_norm_in_dvs_fov"] = [round(v, 5) for v in (self.roi or al.FULL)]
+        if w is not None and webcam_recorded:
+            meta["webcam"] = {
+                "file": os.path.basename(w.final_output_path),
+                "camera": self.camera.name if self.camera else "",
+                "source": str(self.camera.source) if self.camera else "",
+                "full_resolution": list(w.full_size),
+                "crop_rect_norm": [round(v, 5) for v in w.crop_rect],
+                "crop_px_xywh": list(w.crop_info() or []),
+                "recorded_size": list(w.frame_size),
+                "frames": w.frame_count,
+                "fps_actual": round(w.actual_fps or 0, 3),
+            }
+        if d is not None and "dvs" in stop_results:
+            meta["dvs"] = {
+                "file": os.path.basename(d.raw_path),
+                "sensor_size": [d.width, d.height],
+                "hardware_roi_px_xywh": list(d.roi_window) if d.roi_window else None,
+                "hardware_roi_active": bool(d.roi_active),
+            }
+        path = os.path.join(meta.pop("save_dir"), f"{meta['file_name']}_meta.json")
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(meta, f, indent=2, ensure_ascii=False)
+        except OSError as e:
+            self.error.emit(f"Metadaten konnten nicht gespeichert werden: {e}")
+
     def _on_watchdog(self):
         # DVS meldet "ok", liefert aber keine Bilder mehr -> hängt
         if self.dvs is not None and self.dvs.state == "ok":
@@ -192,7 +239,7 @@ class CameraSession(QObject):
             camera_name=self.camera.name,
             save_dir=self.save_dir,
             audio_enabled=self.audio_enabled,
-            zoom_factor=self.zoom_factor,
+            crop_rect=self.webcam_crop(),
         )
         w = self.webcam
         w.update_frame.connect(lambda img, r=w: self._forward_frame(self.webcam_frame, r, img))
@@ -239,6 +286,7 @@ class CameraSession(QObject):
     def _start_dvs(self):
         self.dvs = DVSRecorder()
         d = self.dvs
+        d.roi_window = al.dvs_window(self.roi)
         d.update_frame.connect(lambda img, r=d: self._forward_frame(self.dvs_frame, r, img))
         d.status_changed.connect(self._on_dvs_status)
         d.recording_interrupted.connect(self.recording_interrupted.emit)
@@ -299,12 +347,66 @@ class CameraSession(QObject):
         if self.dvs is None:
             self._start_dvs()
 
-    # ------------------------------------------------------------------- Zoom
+    # ------------------------------------------------- Ausrichtung / Bereich
 
-    def set_zoom(self, factor):
-        self.zoom_factor = factor
+    @property
+    def profile(self):
+        return self.alignment_store.active_profile
+
+    def webcam_crop(self):
+        return al.compose(self.alignment, self.roi)
+
+    def _apply_geometry(self):
         if self.webcam is not None:
-            self.webcam.set_zoom(factor)
+            self.webcam.set_crop(self.webcam_crop())
+        if self.dvs is not None:
+            ok, msg = self.dvs.set_roi(al.dvs_window(self.roi))
+            if not ok:
+                self.error.emit(msg)
+
+    def set_roi(self, rect):
+        """Bereich (normiert im DVS-Bildfeld) setzen; None = ganzes Bild."""
+        if self.recording:
+            return False
+        rect = None if rect is None or al.is_full(rect) else al.clamp_rect(rect)
+        if rect is not None and min(rect[2], rect[3]) < al.MIN_ROI_SIZE:
+            return False
+        self.roi = rect
+        self._apply_geometry()
+        return True
+
+    def set_alignment(self, rect, save=True):
+        if self.recording:
+            return False
+        self.alignment = al.clamp_rect(rect)
+        if save:
+            self.alignment_store.set_alignment(self.alignment)
+        self._apply_geometry()
+        return True
+
+    def set_profile(self, name):
+        if self.recording:
+            return False
+        self.alignment_store.set_active_profile(name)
+        self.alignment = self.alignment_store.alignment()
+        self._apply_geometry()
+        return True
+
+    def begin_alignment(self):
+        """Für die Ausrichtungs-Ansicht: volles Bild beider Kameras."""
+        self._roi_before_alignment = self.roi
+        self.roi = None
+        if self.webcam is not None:
+            self.webcam.set_crop(al.FULL)
+        if self.dvs is not None:
+            self.dvs.set_roi(None)
+            self.dvs.capture_full = True
+
+    def end_alignment(self):
+        if self.dvs is not None:
+            self.dvs.capture_full = False
+        self.roi = self._roi_before_alignment
+        self._apply_geometry()
 
     def set_audio_enabled(self, enabled):
         self.audio_enabled = enabled
@@ -322,29 +424,42 @@ class CameraSession(QObject):
         if self.recording:
             return {"webcam": (False, "Aufnahme läuft bereits")}
 
+        start_unix = {}
         if self.webcam is not None:
             if webcam_audio is not None:
                 self.webcam.has_audio = webcam_audio
+            start_unix["webcam"] = time.time()
             results["webcam"] = self.webcam.start_recording(save_dir, file_name)
         else:
             results["webcam"] = (False, "Keine Webcam verbunden")
 
         if use_dvs:
             if self.dvs is not None and self.status("dvs")[0] in ("ok", "warn"):
+                start_unix["dvs"] = time.time()
                 results["dvs"] = self.dvs.start_recording(save_dir, file_name)
             else:
                 results["dvs"] = (False, self.status("dvs")[1] or "DVS-Kamera nicht bereit")
 
         self.recording = any(ok for ok, _ in results.values())
         self.recording_with_dvs = bool(results.get("dvs", (False,))[0])
+        if self.recording:
+            self._meta = {
+                "save_dir": save_dir,
+                "file_name": file_name,
+                "start": datetime.datetime.now().astimezone().isoformat(timespec="milliseconds"),
+                "start_unix": start_unix,
+                "results": {d: {"ok": ok, "message": m} for d, (ok, m) in results.items()},
+            }
         return results
 
     def stop_recording(self):
         results = {}
-        if self.webcam is not None and self.webcam.recording:
+        webcam_was_recording = self.webcam is not None and self.webcam.recording
+        if webcam_was_recording:
             results["webcam"] = (self.webcam.stop_recording(), "")
         if self.dvs is not None and self.recording_with_dvs:
             results["dvs"] = self.dvs.stop_recording()
+        self._write_metadata(webcam_was_recording, results)
         self.recording = False
         self.recording_with_dvs = False
         # Webcam-Audio-Einstellung wiederherstellen (kann für ext. Mikro aus sein)

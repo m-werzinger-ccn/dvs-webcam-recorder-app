@@ -31,6 +31,10 @@ try:
     from metavision_sdk_core import PeriodicFrameGenerationAlgorithm, ColorPalette
 
     HAS_METAVISION = True
+    try:
+        from metavision_hal import I_ROI
+    except ImportError:  # sehr alte SDK-Versionen
+        I_ROI = None
 except ImportError:
     HAS_METAVISION = False
 
@@ -68,6 +72,14 @@ class DVSRecorder(QThread):
         self.last_frame_time = 0.0
         # Höchstens ein Vorschaubild gleichzeitig unterwegs zur Oberfläche
         self._frame_in_flight = False
+
+        # Hardware-ROI (x, y, w, h in Sensor-Pixeln) oder None = ganzer Sensor.
+        # Ereignisse außerhalb verwirft schon der Sensor -> sie fehlen auch in der RAW-Datei.
+        self.roi_window = None
+        self.roi_active = False  # wurde das ROI vom Gerät tatsächlich übernommen?
+        # Für die Ausrichtungs-Ansicht: letztes volles Vorschaubild behalten
+        self.capture_full = False
+        self.latest_full_frame = None
 
         self._event_count = 0
         self._rate_t0 = time.monotonic()
@@ -139,6 +151,7 @@ class DVSRecorder(QThread):
         self.last_frame_time = time.monotonic()
         self._set_state("ok", f"{self.width}×{self.height}")
         print(f"[DVS] verbunden: {self.width}x{self.height}")
+        self._apply_roi(device)
 
         for evs in iterator:
             if not self.running:
@@ -157,6 +170,8 @@ class DVSRecorder(QThread):
             self.event_rate_mev = self._event_count / (now - self._rate_t0) / 1e6
             self._event_count, self._rate_t0 = 0, now
             detail = f"{self.width}×{self.height} · {self.event_rate_mev:.2f} Mev/s"
+            if self.roi_active and self.roi_window:
+                detail += f" · Bereich {self.roi_window[2]}×{self.roi_window[3]}"
             if self.recording:
                 detail += " · REC"
             self._set_state("ok", detail)
@@ -165,8 +180,14 @@ class DVSRecorder(QThread):
         if not self.running:
             return
         self.last_frame_time = time.monotonic()
+        if self.capture_full:
+            self.latest_full_frame = cd_frame.copy()  # Puffer wird vom SDK wiederverwendet
         if self._frame_in_flight:
             return  # GUI ist noch beim letzten Bild -> dieses verwerfen
+        win = self.roi_window
+        if win and not self.capture_full:
+            x, y, w, h = win
+            cd_frame = cd_frame[y : y + h, x : x + w]
         self._emit_rgb(cv2.cvtColor(cd_frame, cv2.COLOR_BGR2RGB))
 
     def frame_consumed(self):
@@ -216,6 +237,11 @@ class DVSRecorder(QThread):
                     stream.log_raw_data(arg)
                     self.raw_path, self.recording, ok = arg, True, True
                     print(f"[DVS] Aufnahme gestartet: {arg}")
+                elif cmd == "roi":
+                    self.roi_window = arg
+                    ok = self._apply_roi(device)
+                    if not ok:
+                        msg = "Diese DVS-Kamera unterstützt kein Hardware-ROI"
                 elif cmd == "stop":
                     if self.recording:
                         stream.stop_log_raw_data()
@@ -226,13 +252,53 @@ class DVSRecorder(QThread):
                 print(f"[DVS] Befehl '{cmd}' fehlgeschlagen: {e}")
             reply.put((ok, msg))
 
+    def _apply_roi(self, device):
+        """Setzt das Hardware-ROI am Gerät (läuft im Worker-Thread)."""
+        try:
+            roi = device.get_i_roi()
+        except AttributeError:
+            roi = None
+        if roi is None or I_ROI is None:
+            self.roi_active = False
+            if self.roi_window:
+                print("[DVS] Hardware-ROI wird nicht unterstützt – nehme den ganzen Sensor auf")
+            return self.roi_window is None
+        if self.roi_window is None:
+            roi.enable(False)
+            self.roi_active = False
+            print("[DVS] Hardware-ROI aus (ganzer Sensor)")
+            return True
+        x, y, w, h = self.roi_window
+        try:
+            roi.set_mode(I_ROI.Mode.ROI)
+        except Exception:
+            pass  # ältere SDKs kennen set_mode nicht, ROI ist dort Standard
+        roi.set_window(I_ROI.Window(int(x), int(y), int(w), int(h)))
+        roi.enable(True)
+        self.roi_active = True
+        print(f"[DVS] Hardware-ROI: x={x} y={y} {w}×{h}")
+        return True
+
+    def set_roi(self, window):
+        """Hardware-ROI setzen (x, y, w, h) oder None. Nicht während einer Aufnahme."""
+        if self.recording:
+            return False, "Während einer Aufnahme nicht möglich"
+        window = tuple(int(v) for v in window) if window else None
+        if self.state != "ok" or not self.isRunning():
+            self.roi_window = window  # wird beim nächsten Verbinden gesetzt
+            return True, ""
+        return self._send_command("roi", window)
+
     def _fail_pending_commands(self, msg):
         while True:
             try:
-                cmd, _, reply = self._commands.get_nowait()
+                cmd, arg, reply = self._commands.get_nowait()
             except queue.Empty:
                 return
-            if cmd == "stop":
+            if cmd == "roi":
+                self.roi_window = arg  # wird beim nächsten Verbinden gesetzt
+                reply.put((True, ""))
+            elif cmd == "stop":
                 self.recording = False
                 reply.put((True, ""))
             else:

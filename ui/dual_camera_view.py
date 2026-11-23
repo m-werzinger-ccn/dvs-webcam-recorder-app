@@ -25,7 +25,6 @@ from PyQt5.QtWidgets import (
     QProgressBar,
     QPushButton,
     QSizePolicy,
-    QSlider,
     QSplitter,
     QVBoxLayout,
     QWidget,
@@ -38,6 +37,8 @@ from ui.rating_dialog import RatingDialog
 from ui.status_panel import DeviceStatusPanel
 from ui.video_widget import VideoDisplayWidget
 from ui.window_utils import fit_to_screen
+from ui.alignment_dialog import AlignmentDialog
+from utils import alignment as al
 
 
 class DualCameraView(QDialog):
@@ -74,6 +75,9 @@ class DualCameraView(QDialog):
         self.init_ui()
         fit_to_screen(self)
         self._connect_session()
+        for w in self._preview_widgets():
+            w.region_selected.connect(self._on_region_selected)
+        self._apply_saved_region()
 
         self._clock = QTimer(self)
         self._clock.timeout.connect(self._tick)
@@ -120,13 +124,12 @@ class DualCameraView(QDialog):
         # Webcam
         webcam_container = QWidget()
         webcam_layout = QVBoxLayout(webcam_container)
-        webcam_layout.addWidget(self._section_title("Webcam (mit Digital-Zoom)"))
+        webcam_layout.addWidget(self._section_title("Webcam"))
         self.webcam_label = VideoDisplayWidget()
         self.webcam_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.webcam_label.setMinimumSize(320, 180)
         self.webcam_label.setText("Webcam wird verbunden…")
         webcam_layout.addWidget(self.webcam_label)
-        webcam_layout.addWidget(self._build_zoom_group())
         self.splitter.addWidget(webcam_container)
 
         # DVS
@@ -143,6 +146,7 @@ class DualCameraView(QDialog):
             self.splitter.addWidget(dvs_container)
 
         main_layout.addWidget(self.splitter, 1)
+        main_layout.addWidget(self._build_region_group())
 
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
@@ -193,23 +197,90 @@ class DualCameraView(QDialog):
         label.setFont(font)
         return label
 
-    def _build_zoom_group(self):
-        zoom_group = QGroupBox("Digital-Zoom (Bildausschnitt an DVS anpassen)")
-        zoom_layout = QHBoxLayout()
-        zoom_layout.addWidget(QLabel("1.0x"))
-        self.zoom_slider = QSlider(Qt.Horizontal)
-        self.zoom_slider.setRange(10, 30)
-        self.zoom_slider.setValue(int(round(self.session.zoom_factor * 10)))
-        self.zoom_slider.setTickPosition(QSlider.TicksBelow)
-        self.zoom_slider.setTickInterval(5)
-        self.zoom_slider.valueChanged.connect(self.on_zoom_changed)
-        zoom_layout.addWidget(self.zoom_slider, 1)
-        zoom_layout.addWidget(QLabel("3.0x"))
-        self.zoom_value_label = QLabel(f"{self.session.zoom_factor:.1f}x")
-        self.zoom_value_label.setStyleSheet("font-weight: bold; color: #0066cc;")
-        zoom_layout.addWidget(self.zoom_value_label)
-        zoom_group.setLayout(zoom_layout)
-        return zoom_group
+    def _build_region_group(self):
+        self.region_group = QGroupBox("Bildausschnitt")
+        row = QHBoxLayout()
+        self.region_label = QLabel("")
+        row.addWidget(self.region_label, 1)
+        self.select_button = QPushButton("Bereich wählen")
+        self.select_button.setCheckable(True)
+        self.select_button.setToolTip(
+            "Rechteck in einem der Bilder aufziehen – z. B. um Gesicht oder Arm. "
+            "Beide Kameras nehmen dann nur diesen Bereich auf."
+        )
+        self.select_button.toggled.connect(self._on_select_toggled)
+        row.addWidget(self.select_button)
+        self.full_button = QPushButton("Ganzes Bild")
+        self.full_button.clicked.connect(lambda: self._set_region(None))
+        row.addWidget(self.full_button)
+        align_button = QPushButton("Kameras ausrichten…")
+        align_button.setToolTip("Webcam-Ausschnitt an das Bildfeld der DVS anpassen (pro Objektiv)")
+        align_button.clicked.connect(self._open_alignment)
+        row.addWidget(align_button)
+        self.region_group.setLayout(row)
+        return self.region_group
+
+    # ----------------------------------------------------- Bildausschnitt
+
+    def _region_key(self):
+        return self.category["title"]
+
+    def _apply_saved_region(self):
+        self.session.set_roi(self.session.alignment_store.roi(self._region_key()))
+        self._update_region_label()
+
+    def _update_region_label(self):
+        roi = self.session.roi
+        text = f"Objektiv-Profil: <b>{self.session.profile}</b> · "
+        if roi is None:
+            text += "Bereich: <b>ganzes Bild</b>"
+        else:
+            text += f"Bereich: <b>{roi[2] * roi[3]:.0%}</b> des Bildfelds"
+            win = al.dvs_window(roi)
+            if self.use_dvs and win:
+                text += f" (DVS {win[2]}×{win[3]} Pixel)"
+        self.region_label.setText(text)
+        self.full_button.setEnabled(roi is not None)
+
+    def _preview_widgets(self):
+        return [w for w in (self.webcam_label, self.dvs_label) if w is not None]
+
+    def _on_select_toggled(self, active):
+        if active:
+            # Zum Auswählen das ganze Bildfeld zeigen
+            self._roi_before_select = self.session.roi
+            self.session.set_roi(None)
+        elif getattr(self, "_roi_before_select", None) is not None and self.session.roi is None:
+            self.session.set_roi(self._roi_before_select)  # abgebrochen -> alten Bereich zurück
+        for w in self._preview_widgets():
+            w.set_selection_enabled(active)
+        self.select_button.setText("Abbrechen" if active else "Bereich wählen")
+        self._update_region_label()
+
+    def _on_region_selected(self, rect):
+        if min(rect[2], rect[3]) < al.MIN_ROI_SIZE:
+            return  # versehentlicher Klick
+        self._roi_before_select = None
+        self._set_region(rect)
+        self.select_button.setChecked(False)
+
+    def _set_region(self, rect):
+        if self.recording:
+            return
+        if self.select_button.isChecked():
+            self._roi_before_select = None
+            self.select_button.setChecked(False)
+        if self.session.set_roi(rect):
+            self.session.alignment_store.set_roi(self._region_key(), rect)
+        self._update_region_label()
+
+    def _open_alignment(self):
+        if self.recording:
+            return
+        if self.select_button.isChecked():
+            self.select_button.setChecked(False)
+        AlignmentDialog(self.session, self).exec_()
+        self._update_region_label()
 
     def _update_audio_label(self):
         if self.external_mic_enabled and self.external_mic_id is not None:
@@ -254,11 +325,6 @@ class DualCameraView(QDialog):
 
     # --------------------------------------------------------- Einstellungen
 
-    def on_zoom_changed(self, value):
-        factor = value / 10.0
-        self.zoom_value_label.setText(f"{factor:.1f}x")
-        self.session.set_zoom(factor)
-
     def set_audio_enabled(self, enabled):
         self.audio_enabled = enabled
         self._update_audio_label()
@@ -292,6 +358,8 @@ class DualCameraView(QDialog):
             self._start_recording()
 
     def _start_recording(self):
+        if self.select_button.isChecked():
+            self.select_button.setChecked(False)
         storage = self.session.check_storage()
         if storage.state == "error":
             QMessageBox.critical(self, "Speicher", f"Aufnahme nicht möglich:\n{storage.message}")
@@ -376,7 +444,7 @@ class DualCameraView(QDialog):
         self.record_button.setStyleSheet(
             "font-size:15px; font-weight:bold; background:#dc3545; color:white;"
         )
-        self.zoom_slider.setEnabled(False)
+        self.region_group.setEnabled(False)
         self.recording_state_changed.emit(self.card_id, True)
 
     def _stop_recording(self):
@@ -396,7 +464,7 @@ class DualCameraView(QDialog):
         self.record_button.setText("Aufnahme starten")
         self.record_button.setStyleSheet("font-size:15px; font-weight:bold;")
         self.record_button.setEnabled(True)
-        self.zoom_slider.setEnabled(True)
+        self.region_group.setEnabled(True)
         self.recording_state_changed.emit(self.card_id, False)
 
         dvs_ok, dvs_msg = results.get("dvs", (True, ""))
@@ -423,13 +491,13 @@ class DualCameraView(QDialog):
             self.processing = True
             self.progress_bar.setVisible(True)
             self.record_button.setEnabled(False)
-            self.zoom_slider.setEnabled(False)
+            self.region_group.setEnabled(False)
         elif "erfolgreich" in status_msg or "gespeichert" in status_msg:
             self.processing = False
             self.awaiting_processing = False
             self.progress_bar.setVisible(False)
             self.record_button.setEnabled(True)
-            self.zoom_slider.setEnabled(True)
+            self.region_group.setEnabled(True)
             QTimer.singleShot(100, self.show_rating_dialog)
 
     def _tick(self):
@@ -480,6 +548,8 @@ class DualCameraView(QDialog):
                 return
         if self.recording:
             self._stop_recording()
+        if self.select_button.isChecked():
+            self.select_button.setChecked(False)
         self._clock.stop()
         self._disconnect_session()
         self.is_closing = True

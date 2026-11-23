@@ -310,6 +310,8 @@ class MainWindow(QMainWindow):
         toolbar = self.addToolBar("Hauptwerkzeuge")
         new_exam_action = toolbar.addAction("Neue Untersuchung")
         new_exam_action.triggered.connect(self.new_examination)
+        align_action = toolbar.addAction("Kameras ausrichten…")
+        align_action.triggered.connect(self.open_alignment)
 
     def generate_report(self):
         """Generiert einen PDF-Bericht mit den Bewertungen aller Segmente"""
@@ -461,6 +463,13 @@ class MainWindow(QMainWindow):
             # Programm neu starten
             python = sys.executable
             os.execl(python, python, *sys.argv)
+
+    def open_alignment(self):
+        if self.session is None or self.session.recording:
+            return
+        from ui.alignment_dialog import AlignmentDialog
+
+        AlignmentDialog(self.session, self).exec_()
 
     def on_camera_changed(self, index):
         """Andere Webcam gewählt."""
