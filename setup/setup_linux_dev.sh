@@ -24,7 +24,7 @@ PKGS=(
   libopencv-dev libboost-all-dev libusb-1.0-0-dev libprotobuf-dev protobuf-compiler
   libhdf5-dev hdf5-tools libglew-dev libglfw3-dev libcanberra-gtk-module libcanberra-gtk3-module
   python3-dev python3-venv python3-pip pybind11-dev
-  python3-pyqt5 python3-pyaudio python3-numpy python3-opencv
+  python3-pyqt5 python3-pyaudio python3-numpy python3-opencv python3-h5py
   portaudio19-dev ffmpeg v4l-utils usbutils
 )
 sudo apt-get update
@@ -58,17 +58,18 @@ step "3/5 Python-Umgebung $VENV"
 # keine PyQt5-Pakete auf pip), OpenEB wird systemweit installiert.
 [ -d "$VENV" ] || python3 -m venv --system-site-packages "$VENV"
 "$VENV/bin/pip" install --upgrade pip
-REQ="$(find "$SRC_DIR/utils/python" -name 'requirements_openeb*.txt' | head -1 || true)"
-if [ -n "$REQ" ]; then
-  # Diese Pakete braucht OpenEB nur für Beispiele/Tools – Fehler hier nicht fatal
-  "$VENV/bin/pip" install -r "$REQ" || echo "WARNUNG: Nicht alle OpenEB-Python-Extras installiert (für die App unkritisch)"
-fi
+# OpenEBs eigene requirements-Datei NICHT installieren: sie pinnt uralte
+# Versionen (z. B. opencv-python 4.5, numba < 0.60), die mit neuem Python
+# nicht bauen. Die Python-Module von OpenEB brauchen nur numpy und h5py (apt).
 "$VENV/bin/pip" install reportlab
 
 step "4/5 OpenEB bauen und installieren (dauert)"
 mkdir -p "$SRC_DIR/build"
 cd "$SRC_DIR/build"
-cmake .. -DBUILD_TESTING=OFF -DCMAKE_BUILD_TYPE=Release \
+# "-include cstdint": OpenEB 5.x vergisst in einigen Headern <cstdint>;
+# ab GCC 15 (Ubuntu 26.04) ist das ein Fehler.
+cmake .. -Wno-dev -DBUILD_TESTING=OFF -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_CXX_FLAGS="-include cstdint" \
   -DPython3_EXECUTABLE="$(command -v python3)"
 cmake --build . --config Release -- -j"$JOBS"
 sudo cmake --build . --target install
