@@ -27,7 +27,7 @@ python3 -m venv --system-site-packages .venv     # damit Metavision gefunden wir
 bash setup/install_usb_rules.sh                    # danach ab- und wieder anmelden
 ```
 
-Start: `.venv/bin/python main.py`
+Start: `bash setup/run.sh` – oder einmalig `bash setup/install_desktop_shortcut.sh` ausführen, dann gibt es ein Icon „STRAIVER Recorder“ auf dem Schreibtisch und im App-Menü. Jede Sitzung wird in `logs/` mitprotokolliert.
 
 ## 3. Bedienung – Gerätestatus („Ampel“)
 

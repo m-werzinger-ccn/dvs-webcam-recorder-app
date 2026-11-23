@@ -15,7 +15,6 @@ from PyQt5.QtCore import Qt
 # Erst die grundlegenden Module importieren
 import config
 from utils import (
-    create_desktop_shortcut,
     check_available_codecs,
     get_best_codec,
 )
@@ -53,11 +52,8 @@ def main():
     splash.show()
     app.processEvents()
 
-    # Desktop-Verknüpfung erstellen
-    try:
-        create_desktop_shortcut()
-    except Exception as e:
-        print(f"Fehler beim Erstellen der Desktop-Verknüpfung: {e}")
+    # Desktop-Icon wird nicht mehr bei jedem Start angelegt, sondern einmalig mit
+    # setup/install_desktop_shortcut.sh (nutzt die richtige Python-Umgebung).
 
     # Prüfen, ob es sich um ein Qt-Wayland-Problem handelt und eine Warnung anzeigen
     if os.environ.get("XDG_SESSION_TYPE") == "wayland":
