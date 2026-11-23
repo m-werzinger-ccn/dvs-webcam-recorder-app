@@ -31,7 +31,9 @@ sudo apt-get update
 # Je nach Ubuntu-Version fehlen einzelne Pakete -> nur installieren, was es gibt
 AVAILABLE=(); MISSING=()
 for p in "${PKGS[@]}"; do
-  if LC_ALL=C apt-cache policy "$p" 2>/dev/null | grep -q 'Candidate: [^(]'; then
+  # Ausgabe erst speichern: "| grep -q" + pipefail würde sonst immer fehlschlagen
+  POLICY="$(LC_ALL=C apt-cache policy "$p" 2>/dev/null || true)"
+  if grep -q 'Candidate: [^(]' <<<"$POLICY"; then
     AVAILABLE+=("$p")
   else
     MISSING+=("$p")
