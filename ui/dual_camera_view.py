@@ -199,9 +199,11 @@ class DualCameraView(QDialog):
 
     def _build_region_group(self):
         self.region_group = QGroupBox("Bildausschnitt")
-        row = QHBoxLayout()
+        outer = QVBoxLayout()
         self.region_label = QLabel("")
-        row.addWidget(self.region_label, 1)
+        self.region_label.setWordWrap(True)
+        outer.addWidget(self.region_label)
+        row = QHBoxLayout()
         self.select_button = QPushButton("Bereich wählen")
         self.select_button.setCheckable(True)
         self.select_button.setToolTip(
@@ -217,7 +219,9 @@ class DualCameraView(QDialog):
         align_button.setToolTip("Webcam-Ausschnitt an das Bildfeld der DVS anpassen (pro Objektiv)")
         align_button.clicked.connect(self._open_alignment)
         row.addWidget(align_button)
-        self.region_group.setLayout(row)
+        row.addStretch()
+        outer.addLayout(row)
+        self.region_group.setLayout(outer)
         return self.region_group
 
     # ----------------------------------------------------- Bildausschnitt
@@ -231,14 +235,18 @@ class DualCameraView(QDialog):
 
     def _update_region_label(self):
         roi = self.session.roi
-        text = f"Objektiv-Profil: <b>{self.session.profile}</b> · "
+        common = al.common_fov(self.session.alignment)
+        text = (f"Ausrichtung <i>(gilt für alle Untersuchungen)</i>: Profil <b>{self.session.profile}</b>"
+                f"<br>Bereich für diesen Punkt: ")
         if roi is None:
-            text += "Bereich: <b>ganzes Bild</b>"
+            text += "<b>ganzes gemeinsames Bild</b>"
         else:
-            text += f"Bereich: <b>{roi[2] * roi[3]:.0%}</b> des Bildfelds"
-            win = al.dvs_window(roi)
-            if self.use_dvs and win:
-                text += f" (DVS {win[2]}×{win[3]} Pixel)"
+            text += f"<b>{roi[2] * roi[3]:.0%}</b> des Bilds"
+        win = al.dvs_region_window(self.session.alignment, roi)
+        if self.use_dvs and win:
+            text += f" · DVS nimmt {win[2]}×{win[3]} von 1280×720 Pixeln auf"
+        if roi is None and not al.is_full(common):
+            text += " (DVS sieht mehr als die Webcam und wird auf deren Bildfeld beschnitten)"
         self.region_label.setText(text)
         self.full_button.setEnabled(roi is not None)
 

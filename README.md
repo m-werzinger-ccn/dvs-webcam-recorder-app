@@ -48,24 +48,32 @@ Aufnahme ab, erscheint ein roter Warnhinweis.
 
 ## 4. Kameras ausrichten und Bereich wählen
 
-**Kameras ausrichten** (einmal pro Aufbau bzw. Objektiv; Menüleiste oder Aufnahmefenster →
-„Kameras ausrichten…“): Die DVS-Events werden türkis über das Webcam-Bild gelegt. Den gelben
-Rahmen mit der Maus verschieben und mit dem Mausrad skalieren, bis die Events auf den passenden
-Stellen im Webcam-Bild liegen – oder „Automatisch ausrichten“ und die Hand vor beiden Kameras
-bewegen. Pro Objektiv ein eigenes **Objektiv-Profil** anlegen. Die Ausrichtung stimmt exakt für
-die Entfernung, in der ausgerichtet wurde (Webcam und DVS sitzen übereinander) – also am besten
-an der Untersuchungsposition ausrichten.
+Zwei Stufen:
 
-**Bereich wählen** (im Aufnahmefenster): „Bereich wählen“ klicken und in einem der beiden Bilder
-ein Rechteck aufziehen. Dann nehmen **beide Kameras nur diesen Bereich auf**:
-- Webcam: Video wird auf den Bereich zugeschnitten
-- DVS: Hardware-ROI am Sensor – Ereignisse außerhalb werden gar nicht erst aufgezeichnet
+1. **Ausrichtung – gilt für alle Untersuchungen** (einmal pro Aufbau bzw. Objektiv;
+   „Kameras ausrichten…“ in der Werkzeugleiste oder im Aufnahmefenster).
+   Die DVS-Events werden türkis über das Webcam-Bild gelegt, der gelbe Rahmen zeigt das
+   Bildfeld der DVS. Rahmen mit der Maus verschieben, Größe mit dem **Regler „Größe des
+   DVS-Bildfelds“** oder dem Mausrad einstellen (Pfeiltasten zur Feinjustierung), bis die
+   Events auf den passenden Stellen liegen – oder „Automatisch ausrichten“ und die Hand vor
+   beiden Kameras bewegen.
+   - unter 100 %: die DVS sieht einen Ausschnitt der Webcam → die Webcam wird zugeschnitten
+   - über 100 %: die DVS sieht mehr als die Webcam (Rahmen ragt in den grauen Rand) → die
+     DVS wird per Hardware-ROI auf das gemeinsame Bildfeld beschnitten
 
-Der Bereich wird pro NIHSS-Punkt (und Objektiv-Profil) gemerkt. „Ganzes Bild“ hebt ihn auf.
-Gespeichert wird alles in `~/.config/straiver-recorder/alignment.json`.
+   Pro Objektiv ein eigenes **Objektiv-Profil** anlegen. Die Ausrichtung stimmt exakt für die
+   Entfernung, in der ausgerichtet wurde (Webcam und DVS sitzen übereinander) – also an der
+   Untersuchungsposition ausrichten.
 
-Zu jeder Aufnahme schreibt die App eine `<name>_meta.json` mit Start/Stopp-Zeit, Ausrichtung,
-Bereich, Webcam-Zuschnitt in Pixeln, Auflösung, tatsächlicher fps und DVS-ROI.
+2. **Bereich – optional pro NIHSS-Punkt** (im Aufnahmefenster): Standard ist das ganze
+   gemeinsame Bild. „Bereich wählen“ und in einem der beiden Bilder ein Rechteck aufziehen,
+   dann nehmen beide Kameras nur diesen Bereich auf (Webcam zugeschnitten, DVS per
+   Hardware-ROI – Ereignisse außerhalb werden nicht aufgezeichnet). Der Bereich wird pro
+   NIHSS-Punkt gemerkt, „Ganzes Bild“ hebt ihn auf.
+
+Gespeichert wird beides in `~/.config/straiver-recorder/alignment.json`. Zu jeder Aufnahme
+schreibt die App eine `<name>_meta.json` mit Start/Stopp-Zeit, Ausrichtung, gemeinsamem
+Bildfeld, Bereich, Webcam-Zuschnitt in Pixeln, Auflösung, tatsächlicher fps und DVS-ROI.
 
 ## 5. Fehlerbehebung
 

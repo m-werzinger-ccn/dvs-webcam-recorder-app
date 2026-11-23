@@ -185,7 +185,9 @@ class CameraSession(QObject):
         meta["app_version"] = config.APP_VERSION
         meta["lens_profile"] = self.profile
         meta["alignment_webcam_rect_norm"] = [round(v, 5) for v in self.alignment]
-        meta["roi_norm_in_dvs_fov"] = [round(v, 5) for v in (self.roi or al.FULL)]
+        meta["common_fov_in_dvs_norm"] = [round(v, 5) for v in al.common_fov(self.alignment)]
+        meta["roi_norm_in_common_fov"] = [round(v, 5) for v in (self.roi or al.FULL)]
+        meta["region_in_dvs_norm"] = [round(v, 5) for v in al.region_in_dvs(self.alignment, self.roi)]
         if w is not None and webcam_recorded:
             meta["webcam"] = {
                 "file": os.path.basename(w.final_output_path),
@@ -286,7 +288,7 @@ class CameraSession(QObject):
     def _start_dvs(self):
         self.dvs = DVSRecorder()
         d = self.dvs
-        d.roi_window = al.dvs_window(self.roi)
+        d.roi_window = al.dvs_region_window(self.alignment, self.roi)
         d.update_frame.connect(lambda img, r=d: self._forward_frame(self.dvs_frame, r, img))
         d.status_changed.connect(self._on_dvs_status)
         d.recording_interrupted.connect(self.recording_interrupted.emit)
@@ -360,7 +362,7 @@ class CameraSession(QObject):
         if self.webcam is not None:
             self.webcam.set_crop(self.webcam_crop())
         if self.dvs is not None:
-            ok, msg = self.dvs.set_roi(al.dvs_window(self.roi))
+            ok, msg = self.dvs.set_roi(al.dvs_region_window(self.alignment, self.roi))
             if not ok:
                 self.error.emit(msg)
 
@@ -378,7 +380,7 @@ class CameraSession(QObject):
     def set_alignment(self, rect, save=True):
         if self.recording:
             return False
-        self.alignment = al.clamp_rect(rect)
+        self.alignment = al.clamp_alignment(rect)
         if save:
             self.alignment_store.set_alignment(self.alignment)
         self._apply_geometry()
